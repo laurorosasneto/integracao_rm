@@ -31,8 +31,64 @@ def get_connection() -> sqlite3.Connection:
         "updated_at TEXT DEFAULT (datetime('now'))"
         ")"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS platforms ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "name TEXT NOT NULL, "
+        "url TEXT NOT NULL, "
+        "token TEXT NOT NULL, "
+        "created_at TEXT DEFAULT (datetime('now')), "
+        "updated_at TEXT DEFAULT (datetime('now'))"
+        ")"
+    )
     conn.commit()
     return conn
+
+
+def list_platforms() -> list[tuple[int, str, str, str]]:
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "SELECT id, name, url, token FROM platforms ORDER BY id DESC"
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def create_platform(name: str, url: str, token: str) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO platforms (name, url, token, created_at, updated_at) "
+            "VALUES (?, ?, ?, datetime('now'), datetime('now'))",
+            (name, url, token),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_platform(platform_id: int, name: str, url: str, token: str) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE platforms SET name = ?, url = ?, token = ?, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (name, url, token, platform_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_platform(platform_id: int) -> None:
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM platforms WHERE id = ?", (platform_id,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_config(key: str) -> Optional[str]:
