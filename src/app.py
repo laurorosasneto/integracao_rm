@@ -1,10 +1,13 @@
 ﻿from __future__ import annotations
 
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt
+import sys
+
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt, QProcess, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFormLayout,
@@ -13,6 +16,8 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -32,6 +37,8 @@ from core.db import (
     get_config,
     get_rm_config,
     get_rm_queries,
+    get_platform_coligadas,
+    list_platforms_for_select,
     list_platforms,
     set_config,
     set_rm_config,
@@ -91,9 +98,9 @@ class PlatformsTab(QWidget):
         subtitle = QLabel("Gerencie plataformas de integração com URL e Token")
         subtitle.setObjectName("TabSubtitle")
 
-        self.table = QTableWidget(0, 3)
+        self.table = QTableWidget(0, 4)
         self.table.setObjectName("DataTable")
-        self.table.setHorizontalHeaderLabels(["Plataforma", "URL", "Token"])
+        self.table.setHorizontalHeaderLabels(["Plataforma", "URL", "Token", "Coligadas"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -121,6 +128,17 @@ class PlatformsTab(QWidget):
         form_layout.addRow("URL", self.url_input)
         form_layout.addRow("Token", self.token_input)
 
+        self.coligadas_list = QListWidget()
+        self.coligadas_list.setObjectName("Select")
+        self.coligadas_list.itemChanged.connect(self.on_coligadas_changed)
+
+        self.coligadas_summary = QLineEdit()
+        self.coligadas_summary.setReadOnly(True)
+        self.coligadas_summary.setPlaceholderText("Selecione uma ou mais coligadas")
+
+        form_layout.addRow("Coligadas", self.coligadas_list)
+        form_layout.addRow("Selecionadas", self.coligadas_summary)
+
         self.new_button = QPushButton("Novo")
         self.save_button = QPushButton("Salvar")
         self.delete_button = QPushButton("Excluir")
@@ -135,32 +153,46 @@ class PlatformsTab(QWidget):
         actions.addWidget(self.delete_button)
         actions.addStretch(1)
 
-        right = QVBoxLayout()
-        right.addWidget(form)
-        right.addLayout(actions)
-        right.addStretch(1)
+        form_block = QVBoxLayout()
+        form_block.addWidget(form)
+        form_block.addLayout(actions)
 
-        body = QHBoxLayout()
-        body.addWidget(self.table, 2)
-        body.addLayout(right, 1)
+        self._platform_form = form
+        self._platform_actions = actions
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.addWidget(title)
+        content_layout.addWidget(subtitle)
+        content_layout.addLayout(form_block)
+        content_layout.addSpacing(12)
+        content_layout.addWidget(self.table)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setObjectName("TabScroll")
+        scroll.setWidget(content)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addLayout(body)
+        layout.addWidget(scroll)
 
+        self.load_coligadas()
         self.refresh_table()
+        QTimer.singleShot(0, self._sync_table_height)
 
     def refresh_table(self) -> None:
         rows = list_platforms()
         self.table.setRowCount(0)
-        for platform_id, name, url, token in rows:
+        for platform_id, name, url, token, coligadas in rows:
             row = self.table.rowCount()
             self.table.insertRow(row)
             self.table.setItem(row, 0, QTableWidgetItem(name))
             self.table.setItem(row, 1, QTableWidgetItem(url))
             masked = "*" * 8 if token else ""
             self.table.setItem(row, 2, QTableWidgetItem(masked))
+            self.table.setItem(
+                row, 3, QTableWidgetItem(self.get_coligadas_labels_from_csv(coligadas or ""))
+            )
             self.table.setRowHeight(row, 36)
             self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, platform_id)
 
@@ -176,11 +208,12 @@ class PlatformsTab(QWidget):
             return
 
         self.selected_id = int(platform_id)
-        for pid, name, url, token in list_platforms():
+        for pid, name, url, token, coligadas in list_platforms():
             if pid == self.selected_id:
                 self.name_input.setText(name)
                 self.url_input.setText(url)
                 self.token_input.setText(token)
+                self.set_coligadas_from_csv(coligadas or "")
                 break
 
     def on_new(self) -> None:
@@ -189,6 +222,7 @@ class PlatformsTab(QWidget):
         self.url_input.clear()
         self.token_input.clear()
         self.table.clearSelection()
+        self.set_coligadas_from_csv("")
 
     def on_save(self) -> None:
         name = self.name_input.text().strip()
@@ -201,10 +235,11 @@ class PlatformsTab(QWidget):
                 "Preencha Plataforma, URL e Token para salvar.",
             )
             return
+        coligadas = self.get_coligadas_csv()
         if self.selected_id is None:
-            create_platform(name, url, token)
+            create_platform(name, url, token, coligadas)
         else:
-            update_platform(self.selected_id, name, url, token)
+            update_platform(self.selected_id, name, url, token, coligadas)
         self.refresh_table()
         QMessageBox.information(
             self,
@@ -218,6 +253,164 @@ class PlatformsTab(QWidget):
         delete_platform(self.selected_id)
         self.on_new()
         self.refresh_table()
+
+    def _sync_table_height(self) -> None:
+        target = self._platform_form.sizeHint().height() + self._platform_actions.sizeHint().height()
+        self.table.setFixedHeight(max(240, target))
+
+    def load_coligadas(self) -> None:
+        self.coligadas_list.blockSignals(True)
+        self.coligadas_list.clear()
+
+        all_item = QListWidgetItem("Todos")
+        all_item.setData(Qt.ItemDataRole.UserRole, "__ALL__")
+        all_item.setCheckState(Qt.CheckState.Unchecked)
+        self.coligadas_list.addItem(all_item)
+
+        queries = get_rm_queries()
+        config = get_rm_config()
+        sql = queries.get("coligadas", "").strip() if queries else ""
+
+        if not sql or not config:
+            self.coligadas_list.blockSignals(False)
+            return
+
+        host, db_name, username, password = config
+        try:
+            import pyodbc  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            QMessageBox.warning(
+                self,
+                "Driver não disponível",
+                f"Erro ao carregar pyodbc: {exc}",
+            )
+            self.coligadas_list.blockSignals(False)
+            return
+
+        conn_str = (
+            "DRIVER={ODBC Driver 17 for SQL Server};"
+            f"SERVER={host};"
+            f"DATABASE={db_name};"
+            f"UID={username};"
+            f"PWD={password};"
+            "Encrypt=yes;"
+            "TrustServerCertificate=yes;"
+        )
+        try:
+            with pyodbc.connect(conn_str, timeout=10) as conn:
+                cur = conn.cursor()
+                cur.execute(sql)
+                rows = cur.fetchall()
+                columns = [desc[0].lower() for desc in cur.description] if cur.description else []
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Erro ao carregar coligadas",
+                f"Falha ao executar a consulta de Coligadas:\n{exc}",
+            )
+            self.coligadas_list.blockSignals(False)
+            return
+
+        if not rows or not columns:
+            self.coligadas_list.blockSignals(False)
+            return
+
+        def col_index(name: str) -> int | None:
+            return columns.index(name) if name in columns else None
+
+        idx_cod = col_index("codcoligada")
+        idx_nome = col_index("nomefantasia") or col_index("coligada") or col_index("nome")
+        if idx_cod is None or idx_nome is None:
+            QMessageBox.warning(
+                self,
+                "Colunas não encontradas",
+                "A consulta de Coligadas deve retornar CODCOLIGADA e NOMEFANTASIA.",
+            )
+            self.coligadas_list.blockSignals(False)
+            return
+
+        seen: set = set()
+        for row in rows:
+            cod = row[idx_cod]
+            nome = row[idx_nome]
+            if cod in seen:
+                continue
+            seen.add(cod)
+            label = "" if nome is None else str(nome)
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, cod)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.coligadas_list.addItem(item)
+
+        self.coligadas_list.blockSignals(False)
+        self.on_coligadas_changed()
+
+    def on_coligadas_changed(self) -> None:
+        item = self.coligadas_list.currentItem()
+        if item and item.data(Qt.ItemDataRole.UserRole) == "__ALL__":
+            state = item.checkState()
+            self.coligadas_list.blockSignals(True)
+            for i in range(1, self.coligadas_list.count()):
+                self.coligadas_list.item(i).setCheckState(state)
+            self.coligadas_list.blockSignals(False)
+        self._sync_all_item()
+        self.coligadas_summary.setText(self.get_coligadas_labels())
+
+    def get_coligadas_csv(self) -> str:
+        values: list[str] = []
+        for i in range(1, self.coligadas_list.count()):
+            item = self.coligadas_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                values.append(str(item.data(Qt.ItemDataRole.UserRole)))
+        return ",".join(values)
+
+    def get_coligadas_labels(self) -> str:
+        labels: list[str] = []
+        for i in range(1, self.coligadas_list.count()):
+            item = self.coligadas_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                labels.append(item.text())
+        return ", ".join(labels)
+
+    def set_coligadas_from_csv(self, csv_value: str) -> None:
+        selected = {v.strip() for v in csv_value.split(",") if v.strip()}
+        self.coligadas_list.blockSignals(True)
+        for i in range(1, self.coligadas_list.count()):
+            item = self.coligadas_list.item(i)
+            code = str(item.data(Qt.ItemDataRole.UserRole))
+            item.setCheckState(
+                Qt.CheckState.Checked if code in selected else Qt.CheckState.Unchecked
+            )
+        self.coligadas_list.blockSignals(False)
+        self.on_coligadas_changed()
+
+    def get_coligadas_labels_from_csv(self, csv_value: str) -> str:
+        selected = {v.strip() for v in csv_value.split(",") if v.strip()}
+        labels: list[str] = []
+        for i in range(1, self.coligadas_list.count()):
+            item = self.coligadas_list.item(i)
+            code = str(item.data(Qt.ItemDataRole.UserRole))
+            if code in selected:
+                labels.append(item.text())
+        return ", ".join(labels)
+
+    def _sync_all_item(self) -> None:
+        if self.coligadas_list.count() == 0:
+            return
+        total = self.coligadas_list.count() - 1
+        checked = 0
+        for i in range(1, self.coligadas_list.count()):
+            if self.coligadas_list.item(i).checkState() == Qt.CheckState.Checked:
+                checked += 1
+        all_item = self.coligadas_list.item(0)
+        self.coligadas_list.blockSignals(True)
+        if checked == 0:
+            all_item.setCheckState(Qt.CheckState.Unchecked)
+        elif checked == total:
+            all_item.setCheckState(Qt.CheckState.Checked)
+        else:
+            all_item.setCheckState(Qt.CheckState.PartiallyChecked)
+        self.coligadas_list.blockSignals(False)
 
 
 class RMTab(QWidget):
@@ -297,14 +490,6 @@ class RMQueriesTab(QWidget):
         self.coligadas_input.setPlaceholderText("SQL para Coligadas")
         self.coligadas_input.setObjectName("SqlField")
 
-        self.filiais_input = QPlainTextEdit()
-        self.filiais_input.setPlaceholderText("SQL para Filiais")
-        self.filiais_input.setObjectName("SqlField")
-
-        self.niveis_input = QPlainTextEdit()
-        self.niveis_input.setPlaceholderText("SQL para Níveis de ensino")
-        self.niveis_input.setObjectName("SqlField")
-
         self.periodos_input = QPlainTextEdit()
         self.periodos_input.setPlaceholderText("SQL para Períodos")
         self.periodos_input.setObjectName("SqlField")
@@ -317,31 +502,15 @@ class RMQueriesTab(QWidget):
         self.turmas_input.setPlaceholderText("SQL para Turmas")
         self.turmas_input.setObjectName("SqlField")
 
-        self.disciplinas_input = QPlainTextEdit()
-        self.disciplinas_input.setPlaceholderText("SQL para Disciplinas")
-        self.disciplinas_input.setObjectName("SqlField")
-
-        self.professores_input = QPlainTextEdit()
-        self.professores_input.setPlaceholderText("SQL para Professores")
-        self.professores_input.setObjectName("SqlField")
-
-        self.alunos_input = QPlainTextEdit()
-        self.alunos_input.setPlaceholderText("SQL para Alunos")
-        self.alunos_input.setObjectName("SqlField")
+        self.salas_input = QPlainTextEdit()
+        self.salas_input.setPlaceholderText("SQL para Salas")
+        self.salas_input.setObjectName("SqlField")
 
         inner_tabs = QTabWidget()
         inner_tabs.setObjectName("InnerTabs")
         inner_tabs.addTab(
             self._wrap_sql("Coligadas", "coligadas", self.coligadas_input),
             "Coligadas",
-        )
-        inner_tabs.addTab(
-            self._wrap_sql("Filiais", "filiais", self.filiais_input),
-            "Filiais",
-        )
-        inner_tabs.addTab(
-            self._wrap_sql("Níveis de ensino", "niveis_ensino", self.niveis_input),
-            "Níveis de ensino",
         )
         inner_tabs.addTab(
             self._wrap_sql("Períodos", "periodos", self.periodos_input),
@@ -356,16 +525,8 @@ class RMQueriesTab(QWidget):
             "Turmas",
         )
         inner_tabs.addTab(
-            self._wrap_sql("Disciplinas", "disciplinas", self.disciplinas_input),
-            "Disciplinas",
-        )
-        inner_tabs.addTab(
-            self._wrap_sql("Professores", "professores", self.professores_input),
-            "Professores",
-        )
-        inner_tabs.addTab(
-            self._wrap_sql("Alunos", "alunos", self.alunos_input),
-            "Alunos",
+            self._wrap_sql("Salas", "salas", self.salas_input),
+            "Salas",
         )
 
         self.save_button = QPushButton("Salvar consultas")
@@ -390,14 +551,10 @@ class RMQueriesTab(QWidget):
         current = get_rm_queries()
         if current:
             self.coligadas_input.setPlainText(current.get("coligadas", ""))
-            self.filiais_input.setPlainText(current.get("filiais", ""))
-            self.niveis_input.setPlainText(current.get("niveis_ensino", ""))
             self.periodos_input.setPlainText(current.get("periodos", ""))
             self.cursos_input.setPlainText(current.get("cursos", ""))
             self.turmas_input.setPlainText(current.get("turmas", ""))
-            self.disciplinas_input.setPlainText(current.get("disciplinas", ""))
-            self.professores_input.setPlainText(current.get("professores", ""))
-            self.alunos_input.setPlainText(current.get("alunos", ""))
+            self.salas_input.setPlainText(current.get("salas", ""))
 
     def _wrap_sql(self, label: str, key: str, field: QPlainTextEdit) -> QWidget:
         container = QFrame()
@@ -418,14 +575,10 @@ class RMQueriesTab(QWidget):
     def on_save(self) -> None:
         values = {
             "coligadas": self.coligadas_input.toPlainText().strip(),
-            "filiais": self.filiais_input.toPlainText().strip(),
-            "niveis_ensino": self.niveis_input.toPlainText().strip(),
             "periodos": self.periodos_input.toPlainText().strip(),
             "cursos": self.cursos_input.toPlainText().strip(),
             "turmas": self.turmas_input.toPlainText().strip(),
-            "disciplinas": self.disciplinas_input.toPlainText().strip(),
-            "professores": self.professores_input.toPlainText().strip(),
-            "alunos": self.alunos_input.toPlainText().strip(),
+            "salas": self.salas_input.toPlainText().strip(),
         }
         set_rm_queries(values)
         QMessageBox.information(
@@ -437,14 +590,10 @@ class RMQueriesTab(QWidget):
     def on_test(self, key: str) -> None:
         query_map = {
             "coligadas": self.coligadas_input.toPlainText().strip(),
-            "filiais": self.filiais_input.toPlainText().strip(),
-            "niveis_ensino": self.niveis_input.toPlainText().strip(),
             "periodos": self.periodos_input.toPlainText().strip(),
             "cursos": self.cursos_input.toPlainText().strip(),
             "turmas": self.turmas_input.toPlainText().strip(),
-            "disciplinas": self.disciplinas_input.toPlainText().strip(),
-            "professores": self.professores_input.toPlainText().strip(),
-            "alunos": self.alunos_input.toPlainText().strip(),
+            "salas": self.salas_input.toPlainText().strip(),
         }
         sql = query_map.get(key, "")
         if not sql:
@@ -710,6 +859,206 @@ class PaginatedTableModel(QAbstractTableModel):
         self.layoutChanged.emit()
 
 
+class LazyComboBox(QComboBox):
+    def __init__(self, loader=None) -> None:
+        super().__init__()
+        self._loader = loader
+        self._loaded = False
+
+    def set_loader(self, loader) -> None:
+        self._loader = loader
+
+    def reset_loaded(self) -> None:
+        self._loaded = False
+
+    def showPopup(self) -> None:
+        if self._loader and not self._loaded:
+            self._loader()
+            self._loaded = True
+        super().showPopup()
+
+
+class ExecutionTab(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.proc: QProcess | None = None
+
+        title = QLabel("Execução")
+        title.setObjectName("TabTitle")
+        subtitle = QLabel("Execute a criação de categorias no Moodle")
+        subtitle.setObjectName("TabSubtitle")
+
+        form = QFrame()
+        form.setObjectName("FormCard")
+        form_layout = QFormLayout(form)
+        form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+
+        self.platform_select = QComboBox()
+        self.platform_select.setObjectName("Select")
+        self.platform_select.currentIndexChanged.connect(self.on_platform_changed)
+
+        self.periodo_select = LazyComboBox()
+        self.periodo_select.setObjectName("Select")
+        self.periodo_select.set_loader(self.populate_periodos)
+
+        self.create_categories = QCheckBox("Criar Categorias")
+        self.create_categories.setChecked(True)
+
+        form_layout.addRow("Plataforma", self.platform_select)
+        form_layout.addRow("Período", self.periodo_select)
+        form_layout.addRow("", self.create_categories)
+
+        self.execute_button = QPushButton("Executar")
+        self.execute_button.setObjectName("ExecuteButton")
+        self.execute_button.clicked.connect(self.on_execute)
+
+        actions = QHBoxLayout()
+        actions.addWidget(self.execute_button)
+        actions.addStretch(1)
+
+        self.log = QPlainTextEdit()
+        self.log.setObjectName("Terminal")
+        self.log.setReadOnly(True)
+        self.log.setPlaceholderText("Logs da execução aparecerão aqui...")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addWidget(form)
+        layout.addLayout(actions)
+        layout.addWidget(self.log)
+
+        self.load_platforms()
+
+    def load_platforms(self) -> None:
+        self.platform_select.clear()
+        for platform_id, name in list_platforms_for_select():
+            self.platform_select.addItem(name, platform_id)
+
+    def on_platform_changed(self) -> None:
+        self.periodo_select.clear()
+        self.periodo_select.addItem("Todos")
+        self.periodo_select.reset_loaded()
+
+    def populate_periodos(self) -> None:
+        self.periodo_select.clear()
+        self.periodo_select.addItem("Todos")
+
+        queries = get_rm_queries()
+        config = get_rm_config()
+        sql = queries.get("periodos", "").strip() if queries else ""
+        if not sql or not config:
+            return
+
+        host, db_name, username, password = config
+        try:
+            import pyodbc  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            self.append_log(f"Erro ao carregar pyodbc: {exc}")
+            return
+
+        conn_str = (
+            "DRIVER={ODBC Driver 17 for SQL Server};"
+            f"SERVER={host};"
+            f"DATABASE={db_name};"
+            f"UID={username};"
+            f"PWD={password};"
+            "Encrypt=yes;"
+            "TrustServerCertificate=yes;"
+        )
+        try:
+            with pyodbc.connect(conn_str, timeout=10) as conn:
+                cur = conn.cursor()
+                cur.execute(sql)
+                rows = cur.fetchall()
+                columns = [desc[0].lower() for desc in cur.description] if cur.description else []
+        except Exception as exc:
+            self.append_log(f"Erro ao carregar períodos: {exc}")
+            return
+
+        if not rows:
+            return
+
+        def pick_index(candidates: list[str]) -> int | None:
+            for name in candidates:
+                if name in columns:
+                    return columns.index(name)
+            return None
+
+        idx_periodo = pick_index(["periodo", "codperiodo", "codper", "codperlet"])
+        idx_coligada = pick_index(["codcoligada"])
+        if idx_periodo is None and len(columns) == 1:
+            idx_periodo = 0
+
+        allowed = set()
+        platform_id = self.platform_select.currentData()
+        if platform_id is not None:
+            col_csv = get_platform_coligadas(int(platform_id)) or ""
+            allowed = {c.strip() for c in col_csv.split(",") if c.strip()}
+
+        seen: set = set()
+        for row in rows:
+            if idx_periodo is None:
+                continue
+            if idx_coligada is not None and allowed:
+                if str(row[idx_coligada]) not in allowed:
+                    continue
+            value = row[idx_periodo]
+            if value in seen:
+                continue
+            seen.add(value)
+            label = "" if value is None else str(value)
+            self.periodo_select.addItem(label, value)
+
+    def on_execute(self) -> None:
+        if self.platform_select.currentIndex() < 0:
+            QMessageBox.warning(self, "Plataforma obrigatória", "Selecione uma plataforma.")
+            return
+
+        if self.proc and self.proc.state() == QProcess.ProcessState.Running:
+            QMessageBox.information(self, "Execução", "Já existe uma execução em andamento.")
+            return
+
+        platform_id = str(self.platform_select.currentData())
+        periodo = self.periodo_select.currentText()
+        create_cats = "1" if self.create_categories.isChecked() else "0"
+
+        self.append_log("Iniciando execução...")
+        self.execute_button.setEnabled(False)
+
+        self.proc = QProcess(self)
+        self.proc.setProgram(sys.executable)
+        self.proc.setArguments(
+            ["categorias.py", "--platform-id", platform_id, "--periodo", periodo, "--create-categories", create_cats]
+        )
+        self.proc.readyReadStandardOutput.connect(self.on_proc_stdout)
+        self.proc.readyReadStandardError.connect(self.on_proc_stderr)
+        self.proc.finished.connect(self.on_proc_finished)
+        self.proc.start()
+
+    def on_proc_stdout(self) -> None:
+        if not self.proc:
+            return
+        data = self.proc.readAllStandardOutput().data().decode("utf-8", errors="ignore")
+        self.append_log(data.strip())
+
+    def on_proc_stderr(self) -> None:
+        if not self.proc:
+            return
+        data = self.proc.readAllStandardError().data().decode("utf-8", errors="ignore")
+        self.append_log(data.strip())
+
+    def on_proc_finished(self) -> None:
+        self.append_log("Execução finalizada.")
+        self.execute_button.setEnabled(True)
+
+    def append_log(self, text: str) -> None:
+        if not text:
+            return
+        self.log.appendPlainText(text)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -729,6 +1078,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(PlatformsTab(), "Plataformas")
         tabs.addTab(RMTab(), "TOTVS RM")
         tabs.addTab(RMQueriesTab(), "Consultas RM")
+        tabs.addTab(ExecutionTab(), "Execução")
 
         layout = QVBoxLayout(root)
         layout.addWidget(header)
@@ -823,6 +1173,14 @@ def apply_styles(app: QApplication) -> None:
             border: 1px solid #3b82f6;
             background: #ffffff;
         }
+        QPlainTextEdit#Terminal {
+            background: #0b1220;
+            color: #e5e7eb;
+            border-radius: 10px;
+            padding: 10px;
+            font-family: Consolas, "Courier New", monospace;
+            min-height: 220px;
+        }
         QPushButton {
             background: #1f2937;
             color: white;
@@ -835,6 +1193,15 @@ def apply_styles(app: QApplication) -> None:
         }
         QPushButton:pressed {
             background: #0f172a;
+        }
+        #ExecuteButton {
+            background: #16a34a;
+        }
+        #ExecuteButton:hover {
+            background: #15803d;
+        }
+        #ExecuteButton:pressed {
+            background: #166534;
         }
         """
     )
