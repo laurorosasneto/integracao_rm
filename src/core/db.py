@@ -41,6 +41,31 @@ def get_connection() -> sqlite3.Connection:
         "updated_at TEXT DEFAULT (datetime('now'))"
         ")"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rm_config ("
+        "id INTEGER PRIMARY KEY CHECK (id = 1), "
+        "host TEXT NOT NULL, "
+        "database_name TEXT NOT NULL, "
+        "username TEXT NOT NULL, "
+        "password TEXT NOT NULL, "
+        "updated_at TEXT DEFAULT (datetime('now'))"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rm_queries ("
+        "id INTEGER PRIMARY KEY CHECK (id = 1), "
+        "coligadas TEXT, "
+        "filiais TEXT, "
+        "niveis_ensino TEXT, "
+        "periodos TEXT, "
+        "cursos TEXT, "
+        "turmas TEXT, "
+        "disciplinas TEXT, "
+        "professores TEXT, "
+        "alunos TEXT, "
+        "updated_at TEXT DEFAULT (datetime('now'))"
+        ")"
+    )
     conn.commit()
     return conn
 
@@ -86,6 +111,98 @@ def delete_platform(platform_id: int) -> None:
     conn = get_connection()
     try:
         conn.execute("DELETE FROM platforms WHERE id = ?", (platform_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_rm_config() -> tuple[str, str, str, str] | None:
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "SELECT host, database_name, username, password FROM rm_config WHERE id = 1"
+        )
+        row = cur.fetchone()
+        return (row[0], row[1], row[2], row[3]) if row else None
+    finally:
+        conn.close()
+
+
+def set_rm_config(host: str, database_name: str, username: str, password: str) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO rm_config (id, host, database_name, username, password, updated_at) "
+            "VALUES (1, ?, ?, ?, ?, datetime('now')) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "host=excluded.host, database_name=excluded.database_name, "
+            "username=excluded.username, password=excluded.password, "
+            "updated_at=datetime('now')",
+            (host, database_name, username, password),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_rm_queries() -> dict[str, str] | None:
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "SELECT coligadas, filiais, niveis_ensino, periodos, cursos, turmas, "
+            "disciplinas, professores, alunos FROM rm_queries WHERE id = 1"
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        keys = [
+            "coligadas",
+            "filiais",
+            "niveis_ensino",
+            "periodos",
+            "cursos",
+            "turmas",
+            "disciplinas",
+            "professores",
+            "alunos",
+        ]
+        return dict(zip(keys, row))
+    finally:
+        conn.close()
+
+
+def set_rm_queries(values: dict[str, str]) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO rm_queries ("
+            "id, coligadas, filiais, niveis_ensino, periodos, cursos, turmas, "
+            "disciplinas, professores, alunos, updated_at"
+            ") VALUES ("
+            "1, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')"
+            ") ON CONFLICT(id) DO UPDATE SET "
+            "coligadas=excluded.coligadas, "
+            "filiais=excluded.filiais, "
+            "niveis_ensino=excluded.niveis_ensino, "
+            "periodos=excluded.periodos, "
+            "cursos=excluded.cursos, "
+            "turmas=excluded.turmas, "
+            "disciplinas=excluded.disciplinas, "
+            "professores=excluded.professores, "
+            "alunos=excluded.alunos, "
+            "updated_at=datetime('now')",
+            (
+                values.get("coligadas", ""),
+                values.get("filiais", ""),
+                values.get("niveis_ensino", ""),
+                values.get("periodos", ""),
+                values.get("cursos", ""),
+                values.get("turmas", ""),
+                values.get("disciplinas", ""),
+                values.get("professores", ""),
+                values.get("alunos", ""),
+            ),
+        )
         conn.commit()
     finally:
         conn.close()
