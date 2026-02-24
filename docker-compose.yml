@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:16
+    container_name: moodle_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: moodle
+      POSTGRES_USER: moodle
+      POSTGRES_PASSWORD: moodlepass
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U moodle -d moodle"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  web:
+    build: .
+    container_name: moodle_web
+    restart: unless-stopped
+    ports:
+      - "8080:443"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      MOODLE_DBTYPE: pgsql
+      MOODLE_DBHOST: db
+      MOODLE_DBNAME: moodle
+      MOODLE_DBUSER: moodle
+      MOODLE_DBPASS: moodlepass
+      MOODLE_DBPORT: 5432
+    volumes:
+      - ./moodle:/var/www/html
+      - moodledata:/var/www/moodledata
+      - ./docker/ssl:/etc/apache2/ssl
+
+volumes:
+  db_data:
+  moodledata:
