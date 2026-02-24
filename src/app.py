@@ -1,8 +1,9 @@
 ﻿from __future__ import annotations
 
 import sys
+import time
 
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt, QProcess, QTimer
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt, QElapsedTimer, QProcess, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -296,6 +297,8 @@ class PlatformsTab(QWidget):
             "Encrypt=yes;"
             "TrustServerCertificate=yes;"
         )
+
+        t0 = time.monotonic()
         try:
             with pyodbc.connect(conn_str, timeout=10) as conn:
                 cur = conn.cursor()
@@ -303,10 +306,11 @@ class PlatformsTab(QWidget):
                 rows = cur.fetchall()
                 columns = [desc[0].lower() for desc in cur.description] if cur.description else []
         except Exception as exc:
+            dt = time.monotonic() - t0
             QMessageBox.warning(
                 self,
                 "Erro ao carregar coligadas",
-                f"Falha ao executar a consulta de Coligadas:\n{exc}",
+                f"Falha ao executar a consulta de Coligadas ({dt:.3f}s):\n{exc}",
             )
             self.coligadas_list.blockSignals(False)
             return
@@ -324,7 +328,7 @@ class PlatformsTab(QWidget):
             QMessageBox.warning(
                 self,
                 "Colunas não encontradas",
-                "A consulta de Coligadas deve retornar CODCOLIGADA e NOMEFANTASIA.",
+                "A consulta de Coligadas deve retornar CODCOLIGADA e NOMEFANTASIA (ou COLIGADA).",
             )
             self.coligadas_list.blockSignals(False)
             return
@@ -494,9 +498,9 @@ class RMQueriesTab(QWidget):
         self.periodos_input.setPlaceholderText("SQL para Períodos")
         self.periodos_input.setObjectName("SqlField")
 
-        self.cursos_input = QPlainTextEdit()
-        self.cursos_input.setPlaceholderText("SQL para Cursos")
-        self.cursos_input.setObjectName("SqlField")
+        self.categorias_input = QPlainTextEdit()
+        self.categorias_input.setPlaceholderText("SQL para Categorias")
+        self.categorias_input.setObjectName("SqlField")
 
         self.turmas_input = QPlainTextEdit()
         self.turmas_input.setPlaceholderText("SQL para Turmas")
@@ -517,8 +521,8 @@ class RMQueriesTab(QWidget):
             "Períodos",
         )
         inner_tabs.addTab(
-            self._wrap_sql("Cursos", "cursos", self.cursos_input),
-            "Cursos",
+            self._wrap_sql("Categorias", "cursos", self.categorias_input),
+            "Categorias",
         )
         inner_tabs.addTab(
             self._wrap_sql("Turmas", "turmas", self.turmas_input),
@@ -552,7 +556,7 @@ class RMQueriesTab(QWidget):
         if current:
             self.coligadas_input.setPlainText(current.get("coligadas", ""))
             self.periodos_input.setPlainText(current.get("periodos", ""))
-            self.cursos_input.setPlainText(current.get("cursos", ""))
+            self.categorias_input.setPlainText(current.get("cursos", ""))
             self.turmas_input.setPlainText(current.get("turmas", ""))
             self.salas_input.setPlainText(current.get("salas", ""))
 
@@ -576,7 +580,7 @@ class RMQueriesTab(QWidget):
         values = {
             "coligadas": self.coligadas_input.toPlainText().strip(),
             "periodos": self.periodos_input.toPlainText().strip(),
-            "cursos": self.cursos_input.toPlainText().strip(),
+            "cursos": self.categorias_input.toPlainText().strip(),
             "turmas": self.turmas_input.toPlainText().strip(),
             "salas": self.salas_input.toPlainText().strip(),
         }
@@ -591,7 +595,7 @@ class RMQueriesTab(QWidget):
         query_map = {
             "coligadas": self.coligadas_input.toPlainText().strip(),
             "periodos": self.periodos_input.toPlainText().strip(),
-            "cursos": self.cursos_input.toPlainText().strip(),
+            "cursos": self.categorias_input.toPlainText().strip(),
             "turmas": self.turmas_input.toPlainText().strip(),
             "salas": self.salas_input.toPlainText().strip(),
         }
@@ -633,6 +637,8 @@ class RMQueriesTab(QWidget):
             "Encrypt=yes;"
             "TrustServerCertificate=yes;"
         )
+
+        t0 = time.monotonic()
         try:
             with pyodbc.connect(conn_str, timeout=10) as conn:
                 cur = conn.cursor()
@@ -640,10 +646,11 @@ class RMQueriesTab(QWidget):
                 columns = [desc[0] for desc in cur.description] if cur.description else []
                 rows = cur.fetchall()
         except Exception as exc:
+            dt = time.monotonic() - t0
             QMessageBox.critical(
                 self,
                 "Erro ao executar",
-                f"Falha ao executar a consulta:\n{exc}",
+                f"Falha ao executar a consulta ({dt:.3f}s):\n{exc}",
             )
             return
 
@@ -883,6 +890,8 @@ class ExecutionTab(QWidget):
         super().__init__()
 
         self.proc: QProcess | None = None
+        self.exec_timer = QElapsedTimer()
+        self.exec_started = False
 
         title = QLabel("Execução")
         title.setObjectName("TabTitle")
@@ -931,6 +940,56 @@ class ExecutionTab(QWidget):
 
         self.load_platforms()
 
+    def _decode_output(self, raw: bytes) -> str:
+        if not raw:
+            return ""
+        for enc in ("utf-8", "cp1252", "latin-1"):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("latin-1", errors="replace")
+
+    def _norm(self, v) -> str:
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if not s:
+            return ""
+        try:
+            f = float(s.replace(",", "."))
+            i = int(f)
+            if abs(f - i) < 1e-9:
+                return str(i)
+        except Exception:
+            pass
+        return s
+
+    def _strip_sql(self, sql: str) -> str:
+        sql = (sql or "").strip()
+        if sql.endswith(";"):
+            sql = sql[:-1].strip()
+        return sql
+
+    def _remove_last_order_by(self, sql: str) -> str:
+        lower = sql.lower()
+        pos = lower.rfind("order by")
+        if pos == -1:
+            return sql
+        return sql[:pos].strip()
+
+    def _sql_in_list(self, values: set[str]) -> str:
+        cleaned: list[str] = []
+        for v in sorted(values):
+            v = self._norm(v)
+            if not v:
+                continue
+            if v.isdigit():
+                cleaned.append(v)
+            else:
+                cleaned.append("'" + v.replace("'", "''") + "'")
+        return ", ".join(cleaned)
+
     def load_platforms(self) -> None:
         self.platform_select.clear()
         for platform_id, name in list_platforms_for_select():
@@ -942,14 +1001,56 @@ class ExecutionTab(QWidget):
         self.periodo_select.reset_loaded()
 
     def populate_periodos(self) -> None:
+        """
+        Nova regra baseada na sua consulta:
+
+        Consulta de períodos deve retornar:
+        - IDPERLET (value do combo / filtro)
+        - LABELPERIODO (label do combo)
+        - CODCOLIGADA (para filtro por coligadas da plataforma)
+        - CATPERIODO (auxiliar; pode existir duplicidade por modalidade, então deduplica)
+
+        Regras do combo:
+        - label = LABELPERIODO
+        - value = IDPERLET
+        """
         self.periodo_select.clear()
         self.periodo_select.addItem("Todos")
 
+        platform_id = self.platform_select.currentData()
+        if platform_id is None:
+            self.append_log("Nenhuma plataforma selecionada; não carregando períodos.")
+            return
+
+        col_csv = get_platform_coligadas(int(platform_id)) or ""
+        allowed = {self._norm(c) for c in col_csv.split(",") if self._norm(c)}
+        if not allowed:
+            self.append_log("Plataforma não tem coligadas selecionadas; não carregando períodos.")
+            return
+
         queries = get_rm_queries()
         config = get_rm_config()
-        sql = queries.get("periodos", "").strip() if queries else ""
-        if not sql or not config:
+        base_sql = queries.get("periodos", "").strip() if queries else ""
+        if not base_sql or not config:
+            self.append_log("Consulta/config do RM ausente; não carregando períodos.")
             return
+
+        base_sql = self._strip_sql(base_sql)
+        base_no_order = self._remove_last_order_by(base_sql)
+        in_list = self._sql_in_list(allowed)
+        if not in_list:
+            self.append_log("Lista de coligadas inválida (IN vazio); não carregando períodos.")
+            return
+
+        # Filtra por CODCOLIGADA no SQL (subquery), não depende de alias do SQL original
+        sql = (
+            "SELECT X.CODCOLIGADA, X.IDPERLET, X.LABELPERIODO, X.CATPERIODO "
+            "FROM ("
+            + base_no_order
+            + ") X "
+            f"WHERE X.CODCOLIGADA IN ({in_list}) "
+            "ORDER BY X.CATPERIODO DESC, X.IDPERLET DESC"
+        )
 
         host, db_name, username, password = config
         try:
@@ -967,6 +1068,10 @@ class ExecutionTab(QWidget):
             "Encrypt=yes;"
             "TrustServerCertificate=yes;"
         )
+
+        self.append_log(f"Executando consulta RM: periodos (filtrado por CODCOLIGADA IN ({in_list}))")
+        t0 = time.monotonic()
+
         try:
             with pyodbc.connect(conn_str, timeout=10) as conn:
                 cur = conn.cursor()
@@ -974,42 +1079,66 @@ class ExecutionTab(QWidget):
                 rows = cur.fetchall()
                 columns = [desc[0].lower() for desc in cur.description] if cur.description else []
         except Exception as exc:
-            self.append_log(f"Erro ao carregar períodos: {exc}")
+            dt = time.monotonic() - t0
+            self.append_log(f"Consulta RM periodos falhou em {dt:.3f}s: {exc}")
             return
 
-        if not rows:
+        dt = time.monotonic() - t0
+        self.append_log(f"Consulta RM periodos concluída em {dt:.3f}s ({len(rows)} linhas filtradas)")
+
+        if not rows or not columns:
             return
 
-        def pick_index(candidates: list[str]) -> int | None:
-            for name in candidates:
-                if name in columns:
-                    return columns.index(name)
-            return None
+        def idx(name: str):
+            return columns.index(name) if name in columns else None
 
-        idx_periodo = pick_index(["periodo", "codperiodo", "codper", "codperlet"])
-        idx_coligada = pick_index(["codcoligada"])
-        if idx_periodo is None and len(columns) == 1:
-            idx_periodo = 0
+        idx_codcol = idx("codcoligada")
+        idx_idperlet = idx("idperlet")
+        idx_label = idx("labelperiodo")
+        idx_catperiodo = idx("catperiodo")
 
-        allowed = set()
-        platform_id = self.platform_select.currentData()
-        if platform_id is not None:
-            col_csv = get_platform_coligadas(int(platform_id)) or ""
-            allowed = {c.strip() for c in col_csv.split(",") if c.strip()}
+        if idx_codcol is None or idx_idperlet is None or idx_label is None:
+            self.append_log("SQL de períodos deve retornar: CODCOLIGADA, IDPERLET, LABELPERIODO (e opcional CATPERIODO).")
+            return
 
-        seen: set = set()
+        # Deduplica (robusto) e ordena por IDPERLET desc
+        seen: set[tuple[str, str, str]] = set()
+        items: list[tuple[int, str, str]] = []  # (idperlet_int, label, idperlet_str)
+
         for row in rows:
-            if idx_periodo is None:
+            codcol = self._norm(row[idx_codcol])
+            if not codcol or codcol not in allowed:
                 continue
-            if idx_coligada is not None and allowed:
-                if str(row[idx_coligada]) not in allowed:
-                    continue
-            value = row[idx_periodo]
-            if value in seen:
+
+            idperlet_str = self._norm(row[idx_idperlet])
+            label = "" if row[idx_label] is None else str(row[idx_label]).strip()
+            catperiodo = ""
+            if idx_catperiodo is not None:
+                catperiodo = "" if row[idx_catperiodo] is None else str(row[idx_catperiodo]).strip()
+
+            if not idperlet_str or not label:
                 continue
-            seen.add(value)
-            label = "" if value is None else str(value)
-            self.periodo_select.addItem(label, value)
+
+            key = (idperlet_str, label, catperiodo)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            try:
+                idperlet_int = int(float(idperlet_str))
+            except Exception:
+                idperlet_int = 0
+
+            items.append((idperlet_int, label, idperlet_str))
+
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        added = 0
+        for _id_int, label, idperlet_str in items:
+            self.periodo_select.addItem(label, idperlet_str)
+            added += 1
+
+        self.append_log(f"Períodos adicionados: {added}")
 
     def on_execute(self) -> None:
         if self.platform_select.currentIndex() < 0:
@@ -1021,16 +1150,35 @@ class ExecutionTab(QWidget):
             return
 
         platform_id = str(self.platform_select.currentData())
-        periodo = self.periodo_select.currentText()
+        periodo_value = self.periodo_select.currentData()  # IDPERLET
+        idperlet = "" if periodo_value is None else str(periodo_value).strip()
         create_cats = "1" if self.create_categories.isChecked() else "0"
+
+        self.log.clear()
+        self.exec_timer.restart()
+        self.exec_started = True
 
         self.append_log("Iniciando execução...")
         self.execute_button.setEnabled(False)
 
         self.proc = QProcess(self)
         self.proc.setProgram(sys.executable)
+
+        env = self.proc.processEnvironment()
+        env.insert("PYTHONIOENCODING", "utf-8")
+        env.insert("PYTHONUTF8", "1")
+        self.proc.setProcessEnvironment(env)
+
         self.proc.setArguments(
-            ["categorias.py", "--platform-id", platform_id, "--periodo", periodo, "--create-categories", create_cats]
+            [
+                "categorias.py",
+                "--platform-id",
+                platform_id,
+                "--periodo",
+                idperlet,  # IDPERLET vai para o filtro
+                "--create-categories",
+                create_cats,
+            ]
         )
         self.proc.readyReadStandardOutput.connect(self.on_proc_stdout)
         self.proc.readyReadStandardError.connect(self.on_proc_stderr)
@@ -1040,23 +1188,37 @@ class ExecutionTab(QWidget):
     def on_proc_stdout(self) -> None:
         if not self.proc:
             return
-        data = self.proc.readAllStandardOutput().data().decode("utf-8", errors="ignore")
+        raw = bytes(self.proc.readAllStandardOutput())
+        data = self._decode_output(raw)
         self.append_log(data.strip())
 
     def on_proc_stderr(self) -> None:
         if not self.proc:
             return
-        data = self.proc.readAllStandardError().data().decode("utf-8", errors="ignore")
+        raw = bytes(self.proc.readAllStandardError())
+        data = self._decode_output(raw)
         self.append_log(data.strip())
 
     def on_proc_finished(self) -> None:
         self.append_log("Execução finalizada.")
         self.execute_button.setEnabled(True)
+        self.exec_started = False
 
     def append_log(self, text: str) -> None:
         if not text:
             return
-        self.log.appendPlainText(text)
+
+        lines = text.splitlines() if "\n" in text else [text]
+
+        prefix = ""
+        if self.exec_started and self.exec_timer.isValid():
+            prefix = f"[+{self.exec_timer.elapsed() / 1000:.3f}s] "
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            self.log.appendPlainText(prefix + line)
 
 
 class MainWindow(QMainWindow):
