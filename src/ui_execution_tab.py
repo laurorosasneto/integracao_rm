@@ -135,25 +135,19 @@ class ExecutionTab(QWidget):
 
     def on_platform_changed(self) -> None:
         self.periodo_select.clear()
-        self.periodo_select.addItem("Todos")
+        self.periodo_select.addItem("Todos", "Todos")
         self.periodo_select.reset_loaded()
 
     def populate_periodos(self) -> None:
         """
-        Nova regra baseada na sua consulta:
-
         Consulta de períodos deve retornar:
-        - IDPERLET (value do combo / filtro)
+        - CATPERIODO (value do combo / filtro)
         - LABELPERIODO (label do combo)
         - CODCOLIGADA (para filtro por coligadas da plataforma)
-        - CATPERIODO (auxiliar; pode existir duplicidade por modalidade, então deduplica)
-
-        Regras do combo:
-        - label = LABELPERIODO
-        - value = IDPERLET
+        - IDPERLET (não é usado para filtro agora, mas pode vir)
         """
         self.periodo_select.clear()
-        self.periodo_select.addItem("Todos")
+        self.periodo_select.addItem("Todos", "Todos")
 
         platform_id = self.platform_select.currentData()
         if platform_id is None:
@@ -180,14 +174,13 @@ class ExecutionTab(QWidget):
             self.append_log("Lista de coligadas inválida (IN vazio); não carregando períodos.")
             return
 
-        # Filtra por CODCOLIGADA no SQL (subquery), não depende de alias do SQL original
         sql = (
-            "SELECT X.CODCOLIGADA, X.IDPERLET, X.LABELPERIODO, X.CATPERIODO "
+            "SELECT X.CODCOLIGADA, X.CATPERIODO, X.LABELPERIODO, X.IDPERLET "
             "FROM ("
             + base_no_order
             + ") X "
             f"WHERE X.CODCOLIGADA IN ({in_list}) "
-            "ORDER BY X.CATPERIODO DESC, X.IDPERLET DESC"
+            "ORDER BY X.CATPERIODO DESC"
         )
 
         host, db_name, username, password = config
@@ -231,49 +224,40 @@ class ExecutionTab(QWidget):
             return columns.index(name) if name in columns else None
 
         idx_codcol = idx("codcoligada")
-        idx_idperlet = idx("idperlet")
-        idx_label = idx("labelperiodo")
         idx_catperiodo = idx("catperiodo")
+        idx_label = idx("labelperiodo")
 
-        if idx_codcol is None or idx_idperlet is None or idx_label is None:
-            self.append_log("SQL de períodos deve retornar: CODCOLIGADA, IDPERLET, LABELPERIODO (e opcional CATPERIODO).")
+        if idx_codcol is None or idx_catperiodo is None or idx_label is None:
+            self.append_log("SQL de períodos deve retornar: CODCOLIGADA, CATPERIODO, LABELPERIODO (e opcional IDPERLET).")
             return
 
-        # Deduplica (robusto) e ordena por IDPERLET desc
-        seen: set[tuple[str, str, str]] = set()
-        items: list[tuple[int, str, str]] = []  # (idperlet_int, label, idperlet_str)
+        # Deduplica por CATPERIODO + LABEL (normalmente label inclui tipo)
+        seen: set[tuple[str, str]] = set()
+        items: list[tuple[str, str]] = []  # (catperiodo, label)
 
         for row in rows:
             codcol = self._norm(row[idx_codcol])
             if not codcol or codcol not in allowed:
                 continue
 
-            idperlet_str = self._norm(row[idx_idperlet])
+            catperiodo = "" if row[idx_catperiodo] is None else str(row[idx_catperiodo]).strip()
             label = "" if row[idx_label] is None else str(row[idx_label]).strip()
-            catperiodo = ""
-            if idx_catperiodo is not None:
-                catperiodo = "" if row[idx_catperiodo] is None else str(row[idx_catperiodo]).strip()
 
-            if not idperlet_str or not label:
+            if not catperiodo or not label:
                 continue
 
-            key = (idperlet_str, label, catperiodo)
+            key = (catperiodo, label)
             if key in seen:
                 continue
             seen.add(key)
+            items.append((catperiodo, label))
 
-            try:
-                idperlet_int = int(float(idperlet_str))
-            except Exception:
-                idperlet_int = 0
-
-            items.append((idperlet_int, label, idperlet_str))
-
+        # Ordena por CATPERIODO desc (string)
         items.sort(key=lambda x: x[0], reverse=True)
 
         added = 0
-        for _id_int, label, idperlet_str in items:
-            self.periodo_select.addItem(label, idperlet_str)
+        for catperiodo, label in items:
+            self.periodo_select.addItem(label, catperiodo)
             added += 1
 
         self.append_log(f"Períodos adicionados: {added}")
@@ -288,8 +272,13 @@ class ExecutionTab(QWidget):
             return
 
         platform_id = str(self.platform_select.currentData())
-        periodo_value = self.periodo_select.currentData()  # IDPERLET
-        idperlet = "" if periodo_value is None else str(periodo_value).strip()
+
+        # Agora: value do combo = CATPERIODO
+        periodo_value = self.periodo_select.currentData()
+        catperiodo = "" if periodo_value is None else str(periodo_value).strip()
+        if catperiodo.lower() == "todos":
+            catperiodo = ""
+
         create_cats = "1" if self.create_categories.isChecked() else "0"
 
         self.log.clear()
@@ -315,7 +304,7 @@ class ExecutionTab(QWidget):
                 "--platform-id",
                 platform_id,
                 "--periodo",
-                idperlet,  # IDPERLET vai para o filtro
+                catperiodo,  # CATPERIODO vai para o filtro
                 "--create-categories",
                 create_cats,
             ]
