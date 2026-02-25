@@ -1,8 +1,6 @@
 ﻿from __future__ import annotations
 
-from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -28,6 +26,7 @@ class RMQueriesTab(QWidget):
         subtitle = QLabel("Cole as consultas SQL utilizadas para cada entidade")
         subtitle.setObjectName("TabSubtitle")
 
+        # 3 consultas (mantidas)
         self.coligadas_input = QPlainTextEdit()
         self.coligadas_input.setPlaceholderText("SQL para Coligadas")
         self.coligadas_input.setObjectName("SqlField")
@@ -36,17 +35,10 @@ class RMQueriesTab(QWidget):
         self.periodos_input.setPlaceholderText("SQL para Períodos")
         self.periodos_input.setObjectName("SqlField")
 
+        # Importante: persistimos no campo `cursos`
         self.categorias_input = QPlainTextEdit()
-        self.categorias_input.setPlaceholderText("SQL para Categorias")
+        self.categorias_input.setPlaceholderText("SQL base para Categorias/Turmas/Salas")
         self.categorias_input.setObjectName("SqlField")
-
-        self.turmas_input = QPlainTextEdit()
-        self.turmas_input.setPlaceholderText("SQL para Turmas")
-        self.turmas_input.setObjectName("SqlField")
-
-        self.salas_input = QPlainTextEdit()
-        self.salas_input.setPlaceholderText("SQL para Salas")
-        self.salas_input.setObjectName("SqlField")
 
         inner_tabs = QTabWidget()
         inner_tabs.setObjectName("InnerTabs")
@@ -59,16 +51,8 @@ class RMQueriesTab(QWidget):
             "Períodos",
         )
         inner_tabs.addTab(
-            self._wrap_sql("Categorias", "cursos", self.categorias_input),
-            "Categorias",
-        )
-        inner_tabs.addTab(
-            self._wrap_sql("Turmas", "turmas", self.turmas_input),
-            "Turmas",
-        )
-        inner_tabs.addTab(
-            self._wrap_sql("Salas", "salas", self.salas_input),
-            "Salas",
+            self._wrap_sql("Categorias/Turmas/Salas", "cursos", self.categorias_input),
+            "Categorias/Turmas/Salas",
         )
 
         self.save_button = QPushButton("Salvar consultas")
@@ -90,25 +74,29 @@ class RMQueriesTab(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(scroll)
 
+        # Carrega valores atuais
         current = get_rm_queries()
         if current:
-            self.coligadas_input.setPlainText(current.get("coligadas", ""))
-            self.periodos_input.setPlainText(current.get("periodos", ""))
-            self.categorias_input.setPlainText(current.get("cursos", ""))
-            self.turmas_input.setPlainText(current.get("turmas", ""))
-            self.salas_input.setPlainText(current.get("salas", ""))
+            self.coligadas_input.setPlainText(current.get("coligadas", "") or "")
+            self.periodos_input.setPlainText(current.get("periodos", "") or "")
+            # Atenção: "cursos" agora é a query base Categorias/Turmas/Salas
+            self.categorias_input.setPlainText(current.get("cursos", "") or "")
 
     def _wrap_sql(self, label: str, key: str, field: QPlainTextEdit) -> QWidget:
         container = QFrame()
         container.setObjectName("FormCard")
         layout = QVBoxLayout(container)
+
         title = QLabel(label)
         title.setObjectName("CardTitle")
+
         test_button = QPushButton("Testar consulta")
         test_button.clicked.connect(lambda: self.on_test(key))
+
         actions = QHBoxLayout()
         actions.addWidget(test_button)
         actions.addStretch(1)
+
         layout.addWidget(title)
         layout.addWidget(field)
         layout.addLayout(actions)
@@ -119,9 +107,19 @@ class RMQueriesTab(QWidget):
             "coligadas": self.coligadas_input.toPlainText().strip(),
             "periodos": self.periodos_input.toPlainText().strip(),
             "cursos": self.categorias_input.toPlainText().strip(),
-            "turmas": self.turmas_input.toPlainText().strip(),
-            "salas": self.salas_input.toPlainText().strip(),
+            # Mantemos no banco, mas não usamos mais:
+            "turmas": "",
+            "salas": "",
         }
+
+        if not values["coligadas"] or not values["periodos"] or not values["cursos"]:
+            QMessageBox.warning(
+                self,
+                "Campos obrigatórios",
+                "Preencha as três consultas: Coligadas, Períodos e Categorias/Turmas/Salas.",
+            )
+            return
+
         set_rm_queries(values)
         QMessageBox.information(
             self,
@@ -134,9 +132,8 @@ class RMQueriesTab(QWidget):
             "coligadas": self.coligadas_input.toPlainText().strip(),
             "periodos": self.periodos_input.toPlainText().strip(),
             "cursos": self.categorias_input.toPlainText().strip(),
-            "turmas": self.turmas_input.toPlainText().strip(),
-            "salas": self.salas_input.toPlainText().strip(),
         }
+
         sql = query_map.get(key, "")
         if not sql:
             QMessageBox.warning(
@@ -175,6 +172,7 @@ class RMQueriesTab(QWidget):
             "Encrypt=yes;"
             "TrustServerCertificate=yes;"
         )
+
         try:
             with pyodbc.connect(conn_str, timeout=10) as conn:
                 cur = conn.cursor()
