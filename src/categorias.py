@@ -136,14 +136,14 @@ def create_category(base_url: str, token: str, name: str, parent_id: int) -> int
     raise RuntimeError("Falha ao criar categoria")
 
 
-def ensure_category(base_url: str, token: str, name: str, parent_id: int) -> int:
+def ensure_category(base_url: str, token: str, name: str, parent_id: int) -> tuple[int, bool]:
     """
-    Garante que uma categoria (name) exista sob (parent_id) e retorna o id.
+    Garante que uma categoria (name) exista sob (parent_id) e retorna (id, created).
     """
     existing = find_category_id(base_url, token, name, parent_id)
     if existing is not None:
-        return existing
-    return create_category(base_url, token, name, parent_id)
+        return (existing, False)
+    return (create_category(base_url, token, name, parent_id), True)
 
 
 def rm_connect() -> Optional[Tuple[str, str, str, str]]:
@@ -195,6 +195,12 @@ def normalize_str(v: Any) -> str:
     return "" if v is None else str(v).strip()
 
 
+def _chunks(items: List[str], size: int) -> List[List[str]]:
+    if size <= 0:
+        return [items]
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--platform-id", required=True, type=int)
@@ -209,9 +215,16 @@ def main() -> int:
 
     platform_name, url, token, coligadas_csv = platform
 
+    selected_catperiodo = normalize_str(args.periodo).replace("/", "-")
+    filter_by_period = bool(selected_catperiodo) and selected_catperiodo.lower() != "todos"
+
+    log("============================================================")
+    log("INÍCIO DA EXECUÇÃO - INTEGRAÇÃO RM → MOODLE (CATEGORIAS)")
+    log("============================================================")
     log(f"Plataforma: {platform_name} (ID {args.platform_id})")
-    log(f"Período selecionado (CATPERIODO): {args.periodo}")
-    log(f"Criar categorias: {'Sim' if args.create_categories == '1' else 'Não'}")
+    log(f"Moodle URL: {url.rstrip('/')}")
+    log(f"Criar categorias: {'SIM' if args.create_categories == '1' else 'NÃO'}")
+    log(f"Filtro de Período (CATPERIODO): {selected_catperiodo if filter_by_period else 'Todos'}")
 
     try:
         test_token(url, token)
@@ -220,29 +233,40 @@ def main() -> int:
         return 2
 
     if args.create_categories != "1":
-        log("Criação de categorias desativada.")
+        log("Criação de categorias desativada. Nada a fazer.")
+        log("FIM DA EXECUÇÃO")
         return 0
 
     allowed_coligadas = {c.strip() for c in (coligadas_csv or "").split(",") if c.strip()}
     if not allowed_coligadas:
-        log("Nenhuma coligada selecionada na plataforma.")
+        log("Nenhuma coligada selecionada na plataforma. Nada a fazer.")
+        log("FIM DA EXECUÇÃO")
         return 0
+
+    allowed_sorted = sorted(allowed_coligadas, key=lambda x: int(x) if x.isdigit() else x)
+    log(f"Coligadas permitidas ({len(allowed_sorted)}): {', '.join(allowed_sorted)}")
 
     sql_cursos = get_rm_query("cursos")
     if not sql_cursos:
         log("Consulta RM 'cursos' está vazia. Cole na aba Consultas RM > Categorias.")
+        log("FIM DA EXECUÇÃO")
         return 3
 
-    log("SQL RM (cursos/categorias):")
+    log("------------------------------------------------------------")
+    log("SQL RM (cursos/categorias) usada nesta execução:")
+    log("------------------------------------------------------------")
     log(sql_cursos)
 
     t0 = now_ms()
-    log("Executando consulta RM: cursos/categorias")
+    log("------------------------------------------------------------")
+    log("Executando consulta RM: cursos/categorias...")
     columns, rows = rm_fetch(sql_cursos)
-    log(f"Consulta RM cursos/categorias concluída em {ms_to_s(now_ms() - t0)} ({len(rows)} linhas)")
+    dt_rm = now_ms() - t0
+    log(f"Consulta RM concluída em {ms_to_s(dt_rm)} | Linhas retornadas: {len(rows)}")
 
     if not columns or not rows:
         log("Consulta RM 'cursos/categorias' não retornou dados.")
+        log("FIM DA EXECUÇÃO")
         return 3
 
     idx_codcol = col_index(columns, "codcoligada")
@@ -272,17 +296,26 @@ def main() -> int:
             "CODCOLIGADA, COLIGADA, CODPERLET (ou PERIODO/CATPERIODO), IDPERLET, CATMODALIDADE, CURSO."
         )
         log("Faltando: " + ", ".join(missing))
+        log("FIM DA EXECUÇÃO")
         return 3
 
-    selected_catperiodo = normalize_str(args.periodo).replace("/", "-")
-    filter_by_period = bool(selected_catperiodo) and selected_catperiodo.lower() != "todos"
-
+    # Estruturas (já filtradas)
     coligadas_map: Dict[str, str] = {}
     periodos_por_col: Dict[str, Set[str]] = {}
     modalidades_por_col_periodo: Dict[Tuple[str, str], Set[str]] = {}
     cursos_por_col_periodo_modalidade: Dict[Tuple[str, str, str], Set[str]] = {}
 
+    # Contadores de diagnóstico (sem mudar lógica)
+    seen_total = 0
+    skip_coligada = 0
+    skip_periodo = 0
+    skip_catperiodo_empty = 0
+    skip_modalidade_empty = 0
+    skip_curso_empty = 0
+    kept = 0
+
     for r in rows:
+        seen_total += 1
         codcol = normalize_str(r[idx_codcol])
         coligada_nome = normalize_str(r[idx_coligada])
         catperiodo = normalize_str(r[idx_codperlet]).replace("/", "-")
@@ -291,17 +324,24 @@ def main() -> int:
         curso = normalize_str(r[idx_curso])
 
         if not codcol or codcol not in allowed_coligadas:
+            skip_coligada += 1
             continue
 
         if filter_by_period and catperiodo != selected_catperiodo:
+            skip_periodo += 1
             continue
 
         if not catperiodo:
+            skip_catperiodo_empty += 1
             continue
         if not catmodalidade:
+            skip_modalidade_empty += 1
             continue
         if not curso:
+            skip_curso_empty += 1
             continue
+
+        kept += 1
 
         if codcol not in coligadas_map:
             coligadas_map[codcol] = coligada_nome
@@ -310,94 +350,177 @@ def main() -> int:
         modalidades_por_col_periodo.setdefault((codcol, catperiodo), set()).add(catmodalidade)
         cursos_por_col_periodo_modalidade.setdefault((codcol, catperiodo, catmodalidade), set()).add(curso)
 
+    log("------------------------------------------------------------")
+    log("RESUMO DOS FILTROS (APÓS CONSULTA RM):")
+    log("------------------------------------------------------------")
+    log(f"Linhas totais RM: {seen_total}")
+    log(f"Linhas mantidas (após filtros): {kept}")
+    log(f"Descartadas por coligada não permitida: {skip_coligada}")
+    log(f"Descartadas por período (CATPERIODO) diferente: {skip_periodo}")
+    log(f"Descartadas por CATPERIODO vazio: {skip_catperiodo_empty}")
+    log(f"Descartadas por CATMODALIDADE vazio: {skip_modalidade_empty}")
+    log(f"Descartadas por CURSO vazio: {skip_curso_empty}")
+
+    total_periodos = sum(len(v) for v in periodos_por_col.values())
+    total_modalidades = sum(len(v) for v in modalidades_por_col_periodo.values())
+    total_cursos_unicos = sum(len(v) for v in cursos_por_col_periodo_modalidade.values())
+
+    log("------------------------------------------------------------")
+    log("RESUMO DO QUE SERÁ PROCESSADO (ITENS ÚNICOS):")
+    log("------------------------------------------------------------")
+    log(f"Coligadas: {len(coligadas_map)}")
+    log(f"Períodos (CATPERIODO): {total_periodos}")
+    log(f"Modalidades: {total_modalidades}")
+    log(f"Cursos: {total_cursos_unicos}")
+
     if not coligadas_map:
         log("Após filtros, não há coligadas/períodos para processar. Verifique coligadas selecionadas e o período.")
+        log("FIM DA EXECUÇÃO")
         return 0
 
+    # Contadores de criação/encontro no Moodle
+    created_root = 0
+    created_coligadas = 0
+    existing_coligadas = 0
+    created_periodos = 0
+    existing_periodos = 0
+    created_modalidades = 0
+    existing_modalidades = 0
+    created_cursos = 0
+    existing_cursos = 0
+
+    t1 = now_ms()
     try:
-        log("Verificando categoria raiz 'SALAS'...")
+        log("------------------------------------------------------------")
+        log("INICIANDO SINCRONIZAÇÃO NO MOODLE (CATEGORIAS):")
+        log("------------------------------------------------------------")
+
+        # 1) raiz SALAS
+        log("Nível 1: Raiz 'SALAS'")
         root_id = find_category_id(url, token, "SALAS", 0)
         if root_id is None:
-            log("Criando categoria raiz 'SALAS'...")
             root_id = create_category(url, token, "SALAS", 0)
-            log(f"Categoria 'SALAS' criada (id={root_id}).")
+            created_root += 1
+            log(f"- Criada: SALAS (id={root_id})")
         else:
-            log(f"Categoria 'SALAS' já existe (id={root_id}).")
+            log(f"- Já existe: SALAS (id={root_id})")
 
         # 2) Coligadas
-        log("Criando categorias de Coligada (2º nível)...")
+        log("Nível 2: Coligadas")
         coligada_cat_ids: Dict[str, int] = {}
         for codcol, col_nome in sorted(coligadas_map.items(), key=lambda x: int(x[0]) if x[0].isdigit() else x[0]):
             cat_name = f"{codcol}-{col_nome}".strip("-")
-            cid = ensure_category(url, token, cat_name, root_id)
+            cid, created = ensure_category(url, token, cat_name, root_id)
             coligada_cat_ids[codcol] = cid
-            log(f"- Coligada OK: {cat_name} (id={cid})")
+            if created:
+                created_coligadas += 1
+                log(f"- Criada: {cat_name} (id={cid})")
+            else:
+                existing_coligadas += 1
+                log(f"- Já existe: {cat_name} (id={cid})")
             time.sleep(0.05)
 
         # 3) Períodos
-        log("Criando categorias de Período (3º nível)...")
+        log("Nível 3: Períodos (CATPERIODO)")
         periodo_cat_ids: Dict[Tuple[str, str], int] = {}
         for codcol, periods in periodos_por_col.items():
             parent_col_id = coligada_cat_ids.get(codcol)
             if not parent_col_id:
                 continue
             for catperiodo in sorted(periods, reverse=True):
-                pid = ensure_category(url, token, catperiodo, parent_col_id)
+                pid, created = ensure_category(url, token, catperiodo, parent_col_id)
                 periodo_cat_ids[(codcol, catperiodo)] = pid
-                log(f"  - Período OK: {codcol} > {catperiodo} (id={pid})")
+                if created:
+                    created_periodos += 1
+                    log(f"  - Criado: {codcol} > {catperiodo} (id={pid})")
+                else:
+                    existing_periodos += 1
+                    log(f"  - Já existe: {codcol} > {catperiodo} (id={pid})")
                 time.sleep(0.05)
 
-        # 4) Modalidades (cria e registra IDs por (codcol, catperiodo, modalidade))
-        log("Criando categorias de Modalidade (4º nível)...")
+        # 4) Modalidades
+        log("Nível 4: Modalidades")
         modalidade_cat_ids: Dict[Tuple[str, str, str], int] = {}
-        total_modalidades = 0
-
         for (codcol, catperiodo), modalidades in modalidades_por_col_periodo.items():
             parent_per_id = periodo_cat_ids.get((codcol, catperiodo))
             if not parent_per_id:
-                log(f"  - Aviso: período não criado/encontrado para CODCOLIGADA={codcol} CATPERIODO={catperiodo}. Pulando modalidades.")
+                log(f"  - Aviso: período não encontrado para CODCOLIGADA={codcol} CATPERIODO={catperiodo}. Pulando modalidades.")
                 continue
 
             mods = sorted({m for m in modalidades if m.strip()})
             if not mods:
                 continue
 
-            log(f"  - Processando modalidades: CODCOLIGADA={codcol} CATPERIODO={catperiodo} ({len(mods)} itens)")
+            log(f"  - Processando: {codcol} > {catperiodo} ({len(mods)} modalidades)")
             for mod in mods:
-                mid = ensure_category(url, token, mod, parent_per_id)
+                mid, created = ensure_category(url, token, mod, parent_per_id)
                 modalidade_cat_ids[(codcol, catperiodo, mod)] = mid
-                log(f"    * Modalidade OK: {mod} (id={mid})")
-                total_modalidades += 1
+                if created:
+                    created_modalidades += 1
+                    log(f"    * Criada: {mod} (id={mid})")
+                else:
+                    existing_modalidades += 1
+                    log(f"    * Já existe: {mod} (id={mid})")
                 time.sleep(0.05)
 
-        # 5) Cursos (sempre usando o parent correto via modalidade_cat_ids)
-        log("Criando categorias de Curso (5º nível)...")
-        total_cursos = 0
-
+        # 5) Cursos
+        log("Nível 5: Cursos")
         for (codcol, catperiodo, mod), cursos in cursos_por_col_periodo_modalidade.items():
             parent_mod_id = modalidade_cat_ids.get((codcol, catperiodo, mod))
             if not parent_mod_id:
-                # Se por algum motivo a modalidade não foi criada (ou filtrada), não cria curso em lugar errado.
-                log(f"  - Aviso: modalidade não criada/encontrada para CODCOLIGADA={codcol} CATPERIODO={catperiodo} MODALIDADE={mod}. Pulando cursos.")
+                log(f"  - Aviso: modalidade não encontrada para CODCOLIGADA={codcol} CATPERIODO={catperiodo} MODALIDADE={mod}. Pulando cursos.")
                 continue
 
             cursos_clean = sorted({c for c in cursos if c.strip()})
             if not cursos_clean:
                 continue
 
-            log(f"  - Processando cursos: {codcol} > {catperiodo} > {mod} ({len(cursos_clean)} itens)")
+            log(f"  - Processando: {codcol} > {catperiodo} > {mod} ({len(cursos_clean)} cursos)")
             for curso_nome in cursos_clean:
-                cid = ensure_category(url, token, curso_nome, parent_mod_id)
-                log(f"    + Curso OK: {curso_nome} (id={cid})")
-                total_cursos += 1
+                cid, created = ensure_category(url, token, curso_nome, parent_mod_id)
+                if created:
+                    created_cursos += 1
+                    log(f"    + Criado: {curso_nome} (id={cid})")
+                else:
+                    existing_cursos += 1
+                    log(f"    + Já existe: {curso_nome} (id={cid})")
                 time.sleep(0.05)
 
-        log(f"Total de modalidades processadas: {total_modalidades}")
-        log(f"Total de cursos processados: {total_cursos}")
-        log("Execução concluída.")
+        dt_moodle = now_ms() - t1
+        log("============================================================")
+        log("RELATÓRIO DE CONCLUSÃO")
+        log("============================================================")
+        log("Filtros usados:")
+        log(f"- Plataforma: {platform_name} (ID {args.platform_id})")
+        log(f"- Coligadas ({len(allowed_sorted)}): {', '.join(allowed_sorted)}")
+        log(f"- Período (CATPERIODO): {selected_catperiodo if filter_by_period else 'Todos'}")
+        log("")
+        log("Consulta RM:")
+        log(f"- Linhas retornadas: {len(rows)}")
+        log(f"- Linhas mantidas após filtros: {kept}")
+        log(f"- Tempo RM: {ms_to_s(dt_rm)}")
+        log("")
+        log("Itens únicos processados:")
+        log(f"- Coligadas: {len(coligadas_map)}")
+        log(f"- Períodos: {total_periodos}")
+        log(f"- Modalidades: {total_modalidades}")
+        log(f"- Cursos: {total_cursos_unicos}")
+        log("")
+        log("Moodle (criados vs já existentes):")
+        log(f"- Raiz SALAS: criados={created_root}")
+        log(f"- Coligadas: criados={created_coligadas} | já existiam={existing_coligadas}")
+        log(f"- Períodos: criados={created_periodos} | já existiam={existing_periodos}")
+        log(f"- Modalidades: criados={created_modalidades} | já existiam={existing_modalidades}")
+        log(f"- Cursos: criados={created_cursos} | já existiam={existing_cursos}")
+        log("")
+        log(f"Tempo Moodle: {ms_to_s(dt_moodle)}")
+        log("Execução concluída com sucesso.")
         return 0
 
     except Exception as exc:
+        log("============================================================")
+        log("FALHA NA EXECUÇÃO")
+        log("============================================================")
         log(f"Erro ao criar categorias: {exc}")
         return 4
 

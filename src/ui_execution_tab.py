@@ -128,6 +128,36 @@ class ExecutionTab(QWidget):
                 cleaned.append("'" + v.replace("'", "''") + "'")
         return ", ".join(cleaned)
 
+    def _period_sort_key(self, catperiodo: str) -> tuple[int, int, str]:
+        """
+        Ordenação humana/estável para CATPERIODO.
+
+        Esperado comum: 'YYYY-1', 'YYYY-2', ou às vezes 'YYYY-01', 'YYYY-02'.
+        Se não bater, cai para ordenação por texto.
+        """
+        s = (catperiodo or "").strip()
+        if len(s) >= 4 and s[:4].isdigit():
+            year = int(s[:4])
+            rest = s[4:].lstrip("-_/ ").strip()
+
+            term = 0
+            if rest:
+                token = ""
+                for ch in rest:
+                    if ch.isdigit():
+                        token += ch
+                    else:
+                        break
+                if token:
+                    try:
+                        term = int(token)
+                    except Exception:
+                        term = 0
+
+            return (year, term, s)
+
+        return (0, 0, s)
+
     def load_platforms(self) -> None:
         self.platform_select.clear()
         for platform_id, name in list_platforms_for_select():
@@ -141,10 +171,15 @@ class ExecutionTab(QWidget):
     def populate_periodos(self) -> None:
         """
         Consulta de períodos deve retornar:
-        - CATPERIODO (value do combo / filtro)
-        - LABELPERIODO (label do combo)
-        - CODCOLIGADA (para filtro por coligadas da plataforma)
-        - IDPERLET (não é usado para filtro agora, mas pode vir)
+        - CATPERIODO
+        - CODCOLIGADA
+        (LABELPERIODO/IDPERLET podem vir, mas não são usados aqui)
+
+        Regras do combo:
+        - label = CATPERIODO
+        - value = CATPERIODO
+        - sem repetições
+        - ordenação humana por (ano, termo) desc
         """
         self.periodo_select.clear()
         self.periodo_select.addItem("Todos", "Todos")
@@ -175,12 +210,11 @@ class ExecutionTab(QWidget):
             return
 
         sql = (
-            "SELECT X.CODCOLIGADA, X.CATPERIODO, X.LABELPERIODO, X.IDPERLET "
+            "SELECT X.CODCOLIGADA, X.CATPERIODO "
             "FROM ("
             + base_no_order
             + ") X "
             f"WHERE X.CODCOLIGADA IN ({in_list}) "
-            "ORDER BY X.CATPERIODO DESC"
         )
 
         host, db_name, username, password = config
@@ -225,15 +259,13 @@ class ExecutionTab(QWidget):
 
         idx_codcol = idx("codcoligada")
         idx_catperiodo = idx("catperiodo")
-        idx_label = idx("labelperiodo")
 
-        if idx_codcol is None or idx_catperiodo is None or idx_label is None:
-            self.append_log("SQL de períodos deve retornar: CODCOLIGADA, CATPERIODO, LABELPERIODO (e opcional IDPERLET).")
+        if idx_codcol is None or idx_catperiodo is None:
+            self.append_log("SQL de períodos deve retornar: CODCOLIGADA, CATPERIODO.")
             return
 
-        # Deduplica por CATPERIODO + LABEL (normalmente label inclui tipo)
-        seen: set[tuple[str, str]] = set()
-        items: list[tuple[str, str]] = []  # (catperiodo, label)
+        seen_cat: set[str] = set()
+        items: list[str] = []
 
         for row in rows:
             codcol = self._norm(row[idx_codcol])
@@ -241,26 +273,23 @@ class ExecutionTab(QWidget):
                 continue
 
             catperiodo = "" if row[idx_catperiodo] is None else str(row[idx_catperiodo]).strip()
-            label = "" if row[idx_label] is None else str(row[idx_label]).strip()
-
-            if not catperiodo or not label:
+            if not catperiodo:
                 continue
 
-            key = (catperiodo, label)
-            if key in seen:
+            if catperiodo in seen_cat:
                 continue
-            seen.add(key)
-            items.append((catperiodo, label))
+            seen_cat.add(catperiodo)
+            items.append(catperiodo)
 
-        # Ordena por CATPERIODO desc (string)
-        items.sort(key=lambda x: x[0], reverse=True)
+        # Ordena por (ano, termo) desc; se termo não existir, fica 0
+        items.sort(key=self._period_sort_key, reverse=True)
 
         added = 0
-        for catperiodo, label in items:
-            self.periodo_select.addItem(label, catperiodo)
+        for catperiodo in items:
+            self.periodo_select.addItem(catperiodo, catperiodo)
             added += 1
 
-        self.append_log(f"Períodos adicionados: {added}")
+        self.append_log(f"Períodos adicionados (únicos): {added}")
 
     def on_execute(self) -> None:
         if self.platform_select.currentIndex() < 0:
@@ -273,7 +302,6 @@ class ExecutionTab(QWidget):
 
         platform_id = str(self.platform_select.currentData())
 
-        # Agora: value do combo = CATPERIODO
         periodo_value = self.periodo_select.currentData()
         catperiodo = "" if periodo_value is None else str(periodo_value).strip()
         if catperiodo.lower() == "todos":
@@ -304,7 +332,7 @@ class ExecutionTab(QWidget):
                 "--platform-id",
                 platform_id,
                 "--periodo",
-                catperiodo,  # CATPERIODO vai para o filtro
+                catperiodo,
                 "--create-categories",
                 create_cats,
             ]
