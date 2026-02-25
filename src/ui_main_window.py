@@ -4,6 +4,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QLabel, QMainWindow, QTabWidget, QVBoxLayout, QWidget
 
 from ui_execution_tab import ExecutionTab
+from ui_insercao_pessoas_tab import InsercaoPessoasTab
 from ui_platforms_tab import PlatformsTab
 from ui_rm_queries_tab import RMQueriesTab
 from ui_rm_tab import RMTab
@@ -30,7 +31,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(RMTab(), "TOTVS RM")
         tabs.addTab(RMQueriesTab(), "Consultas RM")
         tabs.addTab(SalasModeloTab(), "Salas Modelo")
-        tabs.addTab(ExecutionTab(), "Execução")
+        tabs.addTab(ExecutionTab(), "Estrutura")
+        tabs.addTab(InsercaoPessoasTab(), "Inserção de Pessoas")
 
         layout = QVBoxLayout(root)
         layout.addWidget(header)

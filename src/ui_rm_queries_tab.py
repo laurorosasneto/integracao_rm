@@ -26,7 +26,7 @@ class RMQueriesTab(QWidget):
         subtitle = QLabel("Cole as consultas SQL utilizadas para cada entidade")
         subtitle.setObjectName("TabSubtitle")
 
-        # 3 consultas (mantidas)
+        # Consultas principais
         self.coligadas_input = QPlainTextEdit()
         self.coligadas_input.setPlaceholderText("SQL para Coligadas")
         self.coligadas_input.setObjectName("SqlField")
@@ -39,6 +39,15 @@ class RMQueriesTab(QWidget):
         self.categorias_input = QPlainTextEdit()
         self.categorias_input.setPlaceholderText("SQL base para Categorias/Turmas/Salas")
         self.categorias_input.setObjectName("SqlField")
+
+        # NOVO: Pessoas
+        self.alunos_input = QPlainTextEdit()
+        self.alunos_input.setPlaceholderText("SQL para Alunos (formato será definido na próxima etapa)")
+        self.alunos_input.setObjectName("SqlField")
+
+        self.professores_input = QPlainTextEdit()
+        self.professores_input.setPlaceholderText("SQL para Professores (formato será definido na próxima etapa)")
+        self.professores_input.setObjectName("SqlField")
 
         inner_tabs = QTabWidget()
         inner_tabs.setObjectName("InnerTabs")
@@ -53,6 +62,14 @@ class RMQueriesTab(QWidget):
         inner_tabs.addTab(
             self._wrap_sql("Categorias/Turmas/Salas", "cursos", self.categorias_input),
             "Categorias/Turmas/Salas",
+        )
+        inner_tabs.addTab(
+            self._wrap_sql("Alunos", "alunos", self.alunos_input),
+            "Alunos",
+        )
+        inner_tabs.addTab(
+            self._wrap_sql("Professores", "professores", self.professores_input),
+            "Professores",
         )
 
         self.save_button = QPushButton("Salvar consultas")
@@ -79,8 +96,10 @@ class RMQueriesTab(QWidget):
         if current:
             self.coligadas_input.setPlainText(current.get("coligadas", "") or "")
             self.periodos_input.setPlainText(current.get("periodos", "") or "")
-            # Atenção: "cursos" agora é a query base Categorias/Turmas/Salas
+            # Atenção: "cursos" é a query base Categorias/Turmas/Salas
             self.categorias_input.setPlainText(current.get("cursos", "") or "")
+            self.alunos_input.setPlainText(current.get("alunos", "") or "")
+            self.professores_input.setPlainText(current.get("professores", "") or "")
 
     def _wrap_sql(self, label: str, key: str, field: QPlainTextEdit) -> QWidget:
         container = QFrame()
@@ -103,15 +122,20 @@ class RMQueriesTab(QWidget):
         return container
 
     def on_save(self) -> None:
+        # Mantemos no banco (retrocompatibilidade):
+        # - `cursos` = base Categorias/Turmas/Salas
+        # - `turmas` e `salas` ficam vazios (não usados mais)
         values = {
             "coligadas": self.coligadas_input.toPlainText().strip(),
             "periodos": self.periodos_input.toPlainText().strip(),
             "cursos": self.categorias_input.toPlainText().strip(),
-            # Mantemos no banco, mas não usamos mais:
             "turmas": "",
             "salas": "",
+            "alunos": self.alunos_input.toPlainText().strip(),
+            "professores": self.professores_input.toPlainText().strip(),
         }
 
+        # Regras atuais: obrigatórias apenas as 3 consultas estruturais.
         if not values["coligadas"] or not values["periodos"] or not values["cursos"]:
             QMessageBox.warning(
                 self,
@@ -132,6 +156,8 @@ class RMQueriesTab(QWidget):
             "coligadas": self.coligadas_input.toPlainText().strip(),
             "periodos": self.periodos_input.toPlainText().strip(),
             "cursos": self.categorias_input.toPlainText().strip(),
+            "alunos": self.alunos_input.toPlainText().strip(),
+            "professores": self.professores_input.toPlainText().strip(),
         }
 
         sql = query_map.get(key, "")
