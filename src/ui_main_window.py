@@ -7,6 +7,7 @@ from ui_execution_tab import ExecutionTab
 from ui_platforms_tab import PlatformsTab
 from ui_rm_queries_tab import RMQueriesTab
 from ui_rm_tab import RMTab
+from ui_salas_modelo_tab import SalasModeloTab
 
 
 class MainWindow(QMainWindow):
@@ -28,6 +29,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(PlatformsTab(), "Plataformas")
         tabs.addTab(RMTab(), "TOTVS RM")
         tabs.addTab(RMQueriesTab(), "Consultas RM")
+        tabs.addTab(SalasModeloTab(), "Salas Modelo")
         tabs.addTab(ExecutionTab(), "Execução")
 
         layout = QVBoxLayout(root)

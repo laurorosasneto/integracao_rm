@@ -81,6 +81,21 @@ def get_connection() -> sqlite3.Connection:
         ")"
     )
     _ensure_column(conn, "routines", "sala", "TEXT")
+
+    # --- NOVO: Salas Modelo ---
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS salas_modelo ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "platform_id INTEGER NOT NULL, "
+        "name TEXT NOT NULL, "
+        "moodle_id TEXT NOT NULL, "
+        "extra_filter TEXT, "
+        "created_at TEXT DEFAULT (datetime('now')), "
+        "updated_at TEXT DEFAULT (datetime('now'))"
+        ")"
+    )
+    _ensure_column(conn, "salas_modelo", "extra_filter", "TEXT")
+
     conn.commit()
     return conn
 
@@ -336,6 +351,60 @@ def set_config(key: str, value: str) -> None:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
             (key, value),
         )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# -------------------------
+# Salas Modelo (CRUD)
+# -------------------------
+
+def list_salas_modelo() -> list[tuple]:
+    """Lista registros de Salas Modelo com JOIN da plataforma."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "SELECT s.id, s.created_at, s.platform_id, p.name, s.name, s.moodle_id, s.extra_filter, s.updated_at "
+            "FROM salas_modelo s "
+            "LEFT JOIN platforms p ON p.id = s.platform_id "
+            "ORDER BY s.id DESC"
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def create_sala_modelo(platform_id: int, name: str, moodle_id: str, extra_filter: str) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO salas_modelo (platform_id, name, moodle_id, extra_filter, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))",
+            (platform_id, name, moodle_id, extra_filter),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_sala_modelo(sala_modelo_id: int, platform_id: int, name: str, moodle_id: str, extra_filter: str) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE salas_modelo SET platform_id = ?, name = ?, moodle_id = ?, extra_filter = ?, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (platform_id, name, moodle_id, extra_filter, sala_modelo_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_sala_modelo(sala_modelo_id: int) -> None:
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM salas_modelo WHERE id = ?", (sala_modelo_id,))
         conn.commit()
     finally:
         conn.close()
