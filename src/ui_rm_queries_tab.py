@@ -49,6 +49,15 @@ class RMQueriesTab(QWidget):
         self.professores_input.setPlaceholderText("SQL para Professores (formato será definido na próxima etapa)")
         self.professores_input.setObjectName("SqlField")
 
+        # NOVO: Ensalamento
+        self.ensalamento_alunos_input = QPlainTextEdit()
+        self.ensalamento_alunos_input.setPlaceholderText("SQL para Ensalamento de Alunos")
+        self.ensalamento_alunos_input.setObjectName("SqlField")
+
+        self.ensalamento_professores_input = QPlainTextEdit()
+        self.ensalamento_professores_input.setPlaceholderText("SQL para Ensalamento de Professores")
+        self.ensalamento_professores_input.setObjectName("SqlField")
+
         inner_tabs = QTabWidget()
         inner_tabs.setObjectName("InnerTabs")
         inner_tabs.addTab(
@@ -70,6 +79,14 @@ class RMQueriesTab(QWidget):
         inner_tabs.addTab(
             self._wrap_sql("Professores", "professores", self.professores_input),
             "Professores",
+        )
+        inner_tabs.addTab(
+            self._wrap_sql("Ensalamento Alunos", "ensalamento_alunos", self.ensalamento_alunos_input),
+            "Ensalamento Alunos",
+        )
+        inner_tabs.addTab(
+            self._wrap_sql("Ensalamento Professores", "ensalamento_professores", self.ensalamento_professores_input),
+            "Ensalamento Professores",
         )
 
         self.save_button = QPushButton("Salvar consultas")
@@ -100,6 +117,8 @@ class RMQueriesTab(QWidget):
             self.categorias_input.setPlainText(current.get("cursos", "") or "")
             self.alunos_input.setPlainText(current.get("alunos", "") or "")
             self.professores_input.setPlainText(current.get("professores", "") or "")
+            self.ensalamento_alunos_input.setPlainText(current.get("ensalamento_alunos", "") or "")
+            self.ensalamento_professores_input.setPlainText(current.get("ensalamento_professores", "") or "")
 
     def _wrap_sql(self, label: str, key: str, field: QPlainTextEdit) -> QWidget:
         container = QFrame()
@@ -133,6 +152,8 @@ class RMQueriesTab(QWidget):
             "salas": "",
             "alunos": self.alunos_input.toPlainText().strip(),
             "professores": self.professores_input.toPlainText().strip(),
+            "ensalamento_alunos": self.ensalamento_alunos_input.toPlainText().strip(),
+            "ensalamento_professores": self.ensalamento_professores_input.toPlainText().strip(),
         }
 
         # Regras atuais: obrigatórias apenas as 3 consultas estruturais.
@@ -158,6 +179,8 @@ class RMQueriesTab(QWidget):
             "cursos": self.categorias_input.toPlainText().strip(),
             "alunos": self.alunos_input.toPlainText().strip(),
             "professores": self.professores_input.toPlainText().strip(),
+            "ensalamento_alunos": self.ensalamento_alunos_input.toPlainText().strip(),
+            "ensalamento_professores": self.ensalamento_professores_input.toPlainText().strip(),
         }
 
         sql = query_map.get(key, "")

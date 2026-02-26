@@ -217,24 +217,81 @@ def assert_course_exists_by_id(base_url: str, token: str, courseid: int) -> None
 
 
 def find_root_category_id_by_name(base_url: str, token: str, name: str) -> int | None:
+    """
+    Localiza uma categoria raiz (parent=0) com nome exato.
+    Se houver múltiplas, escolhe a que tem mais filhos diretos.
+    Empate: escolhe a de maior id.
+    """
+    name = (name or "").strip()
+    if not name:
+        return None
+
+    # Busca mais robusta: parent=0 e name=SALAS
     data = moodle_call(
         base_url,
         token,
         "core_course_get_categories",
-        {"criteria[0][key]": "name", "criteria[0][value]": name},
+        {
+            "criteria[0][key]": "parent",
+            "criteria[0][value]": "0",
+            "criteria[1][key]": "name",
+            "criteria[1][value]": name,
+        },
     )
+
     cats = data if isinstance(data, list) else []
-    roots = []
+    roots: list[dict] = []
+
     for c in cats:
         try:
             if int(c.get("parent", -1)) == 0 and str(c.get("name", "")).strip() == name:
                 roots.append(c)
         except Exception:
             continue
+
     if not roots:
         return None
-    roots_sorted = sorted(roots, key=lambda x: int(x.get("id", 10**18)))
-    return int(roots_sorted[0].get("id"))
+
+    # Se só existe uma, retorna direto
+    if len(roots) == 1:
+        return int(roots[0].get("id"))
+
+    # Se existem múltiplas, escolher a "melhor" (mais filhos diretos)
+    def count_children(root_id: int) -> int:
+        try:
+            children = moodle_call(
+                base_url,
+                token,
+                "core_course_get_categories",
+                {"criteria[0][key]": "parent", "criteria[0][value]": str(int(root_id))},
+            )
+            if isinstance(children, list):
+                return len(children)
+        except Exception:
+            pass
+        return 0
+
+    scored: list[tuple[int, int]] = []  # (children_count, root_id)
+    for r in roots:
+        try:
+            rid = int(r.get("id"))
+            scored.append((count_children(rid), rid))
+        except Exception:
+            continue
+
+    if not scored:
+        # fallback: maior id (mais recente)
+        return int(max(int(r.get("id", 0)) for r in roots))
+
+    # maior número de filhos; empate => maior id
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    chosen_children, chosen_id = scored[0]
+    log(
+        f"Aviso: existem múltiplas categorias raiz '{name}'. "
+        f"Escolhendo id={chosen_id} (filhos={chosen_children})."
+    )
+    return int(chosen_id)
 
 
 def find_category_id(base_url: str, token: str, name: str, parent_id: int) -> int | None:

@@ -71,7 +71,7 @@ def init_db() -> None:
             """
         )
 
-        # Consultas RM
+        # Consultas RM (inclui ensalamento)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS rm_queries (
@@ -83,6 +83,8 @@ def init_db() -> None:
                 salas TEXT,
                 alunos TEXT,
                 professores TEXT,
+                ensalamento_alunos TEXT,
+                ensalamento_professores TEXT,
                 updated_at TEXT DEFAULT (datetime('now'))
             )
             """
@@ -90,6 +92,8 @@ def init_db() -> None:
         _ensure_column(conn, "rm_queries", "salas", "TEXT")
         _ensure_column(conn, "rm_queries", "alunos", "TEXT")
         _ensure_column(conn, "rm_queries", "professores", "TEXT")
+        _ensure_column(conn, "rm_queries", "ensalamento_alunos", "TEXT")
+        _ensure_column(conn, "rm_queries", "ensalamento_professores", "TEXT")
 
         # Salas Modelo
         conn.execute(
@@ -106,7 +110,7 @@ def init_db() -> None:
             )
             """
         )
-        # compatibilidade: se a tabela já existia sem created_at
+        # Se a tabela já existia antes sem colunas de auditoria
         _ensure_column(conn, "salas_modelo", "created_at", "TEXT")
         _ensure_column(conn, "salas_modelo", "updated_at", "TEXT")
 
@@ -149,19 +153,16 @@ def set_config(key: str, value: str) -> None:
 
 
 # --------------------------
-# Platforms (UI: PlatformsTab / InsercaoPessoasTab / combos)
+# Platforms (UI: PlatformsTab / combos)
 # --------------------------
 def list_platforms() -> List[Tuple[int, str, str, str, str]]:
     """
     Retorna: [(id, name, url, token, coligadas_csv), ...]
-    Usado pela aba Plataformas.
     """
     init_db()
     conn = _connect()
     try:
-        cur = conn.execute(
-            "SELECT id, name, url, token, coligadas FROM platforms ORDER BY id ASC"
-        )
+        cur = conn.execute("SELECT id, name, url, token, coligadas FROM platforms ORDER BY id ASC")
         out: List[Tuple[int, str, str, str, str]] = []
         for row in cur.fetchall():
             out.append((int(row[0]), row[1] or "", row[2] or "", row[3] or "", row[4] or ""))
@@ -173,7 +174,6 @@ def list_platforms() -> List[Tuple[int, str, str, str, str]]:
 def list_platforms_for_select() -> List[Tuple[int, str]]:
     """
     Retorna: [(id, name), ...]
-    Usado pelos combos (Salas Modelo, Estrutura).
     """
     init_db()
     conn = _connect()
@@ -235,7 +235,6 @@ def delete_platform(platform_id: int) -> None:
 def get_platform_coligadas(platform_id: int) -> str:
     """
     Retorna o CSV de coligadas da plataforma.
-    Usado na aba Estrutura para filtrar períodos.
     """
     init_db()
     conn = _connect()
@@ -250,20 +249,12 @@ def get_platform_coligadas(platform_id: int) -> str:
 def get_platforms() -> List[Dict[str, Any]]:
     """
     Retorna lista de dicts.
-    Usado em ui_incercao_pessoas_tab.py (InsercaoPessoasTab).
+    Usado em ui_insercao_pessoas_tab.py.
     """
     rows = list_platforms()
     out: List[Dict[str, Any]] = []
     for pid, name, url, token, coligadas in rows:
-        out.append(
-            {
-                "id": pid,
-                "name": name,
-                "url": url,
-                "token": token,
-                "coligadas": coligadas or "",
-            }
-        )
+        out.append({"id": pid, "name": name, "url": url, "token": token, "coligadas": coligadas})
     return out
 
 
@@ -274,9 +265,7 @@ def get_rm_config() -> Optional[Tuple[str, str, str, str]]:
     init_db()
     conn = _connect()
     try:
-        cur = conn.execute(
-            "SELECT host, database_name, username, password FROM rm_config WHERE id = 1"
-        )
+        cur = conn.execute("SELECT host, database_name, username, password FROM rm_config WHERE id = 1")
         row = cur.fetchone()
         if not row:
             return None
@@ -316,7 +305,7 @@ def get_rm_queries() -> Optional[Dict[str, str]]:
     try:
         cur = conn.execute(
             """
-            SELECT coligadas, periodos, cursos, turmas, salas, alunos, professores
+            SELECT coligadas, periodos, cursos, turmas, salas, alunos, professores, ensalamento_alunos, ensalamento_professores
               FROM rm_queries
              WHERE id = 1
             """
@@ -325,7 +314,17 @@ def get_rm_queries() -> Optional[Dict[str, str]]:
         if not row:
             return None
 
-        keys = ["coligadas", "periodos", "cursos", "turmas", "salas", "alunos", "professores"]
+        keys = [
+            "coligadas",
+            "periodos",
+            "cursos",
+            "turmas",
+            "salas",
+            "alunos",
+            "professores",
+            "ensalamento_alunos",
+            "ensalamento_professores",
+        ]
         data = dict(zip(keys, row))
         return {k: (data.get(k) or "") for k in keys}
     finally:
@@ -339,9 +338,9 @@ def set_rm_queries(values: Dict[str, str]) -> None:
         conn.execute(
             """
             INSERT INTO rm_queries (
-                id, coligadas, periodos, cursos, turmas, salas, alunos, professores, updated_at
+                id, coligadas, periodos, cursos, turmas, salas, alunos, professores, ensalamento_alunos, ensalamento_professores, updated_at
             )
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(id) DO UPDATE SET
                 coligadas=excluded.coligadas,
                 periodos=excluded.periodos,
@@ -350,6 +349,8 @@ def set_rm_queries(values: Dict[str, str]) -> None:
                 salas=excluded.salas,
                 alunos=excluded.alunos,
                 professores=excluded.professores,
+                ensalamento_alunos=excluded.ensalamento_alunos,
+                ensalamento_professores=excluded.ensalamento_professores,
                 updated_at=datetime('now')
             """,
             (
@@ -360,6 +361,8 @@ def set_rm_queries(values: Dict[str, str]) -> None:
                 values.get("salas", "") or "",
                 values.get("alunos", "") or "",
                 values.get("professores", "") or "",
+                values.get("ensalamento_alunos", "") or "",
+                values.get("ensalamento_professores", "") or "",
             ),
         )
         conn.commit()
@@ -368,13 +371,15 @@ def set_rm_queries(values: Dict[str, str]) -> None:
 
 
 # --------------------------
-# Salas Modelo
+# Salas Modelo (COMPATÍVEL com ui_salas_modelo_tab.py)
 # --------------------------
 def list_salas_modelo() -> List[Tuple[int, str, int, str, str, str, str, str]]:
     """
-    Retorna:
-    (id, created_at, platform_id, platform_name, name, moodle_id, extra_filter, updated_at)
-    Exatamente como a UI espera.
+    IMPORTANTE:
+    ui_salas_modelo_tab.py faz unpack assim:
+      (sala_id, created_at, platform_id, platform_name, name, moodle_id, extra_filter, updated_at)
+
+    Então retornamos EXATAMENTE 8 campos nessa ordem.
     """
     init_db()
     conn = _connect()
@@ -382,34 +387,32 @@ def list_salas_modelo() -> List[Tuple[int, str, int, str, str, str, str, str]]:
         cur = conn.execute(
             """
             SELECT
-                sm.id,
-                COALESCE(sm.created_at, '') AS created_at,
-                sm.platform_id,
-                COALESCE(p.name, '') AS platform_name,
-                sm.name,
-                sm.moodle_id,
-                COALESCE(sm.extra_filter, '') AS extra_filter,
-                COALESCE(sm.updated_at, '') AS updated_at
-            FROM salas_modelo sm
-            LEFT JOIN platforms p ON p.id = sm.platform_id
-            ORDER BY sm.id ASC
+                s.id,
+                COALESCE(s.created_at, ''),
+                s.platform_id,
+                COALESCE(p.name, ''),
+                COALESCE(s.name, ''),
+                COALESCE(s.moodle_id, ''),
+                COALESCE(s.extra_filter, ''),
+                COALESCE(s.updated_at, '')
+            FROM salas_modelo s
+            JOIN platforms p ON p.id = s.platform_id
+            ORDER BY p.name COLLATE NOCASE ASC, s.name COLLATE NOCASE ASC, s.id ASC
             """
         )
-        out: List[Tuple[int, str, int, str, str, str, str, str]] = []
-        for r in cur.fetchall():
-            out.append(
-                (
-                    int(r[0]),
-                    r[1] or "",
-                    int(r[2]),
-                    r[3] or "",
-                    r[4] or "",
-                    r[5] or "",
-                    r[6] or "",
-                    r[7] or "",
-                )
+        return [
+            (
+                int(r[0]),
+                str(r[1] or ""),
+                int(r[2]),
+                str(r[3] or ""),
+                str(r[4] or ""),
+                str(r[5] or ""),
+                str(r[6] or ""),
+                str(r[7] or ""),
             )
-        return out
+            for r in cur.fetchall()
+        ]
     finally:
         conn.close()
 
@@ -431,13 +434,7 @@ def create_sala_modelo(platform_id: int, name: str, moodle_id: str, extra_filter
         conn.close()
 
 
-def update_sala_modelo(
-    sala_modelo_id: int,
-    platform_id: int,
-    name: str,
-    moodle_id: str,
-    extra_filter: str,
-) -> None:
+def update_sala_modelo(sala_id: int, platform_id: int, name: str, moodle_id: str, extra_filter: str) -> None:
     init_db()
     conn = _connect()
     try:
@@ -451,18 +448,18 @@ def update_sala_modelo(
                    updated_at = datetime('now')
              WHERE id = ?
             """,
-            (int(platform_id), name, moodle_id, extra_filter or "", int(sala_modelo_id)),
+            (int(platform_id), name, moodle_id, extra_filter or "", int(sala_id)),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def delete_sala_modelo(sala_modelo_id: int) -> None:
+def delete_sala_modelo(sala_id: int) -> None:
     init_db()
     conn = _connect()
     try:
-        conn.execute("DELETE FROM salas_modelo WHERE id = ?", (int(sala_modelo_id),))
+        conn.execute("DELETE FROM salas_modelo WHERE id = ?", (int(sala_id),))
         conn.commit()
     finally:
         conn.close()
