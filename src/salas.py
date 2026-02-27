@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -13,10 +14,6 @@ DB_PATH = Path(__file__).resolve().parent.parent / "db" / "app.db"
 
 def log(msg: str) -> None:
     print(msg, flush=True)
-
-
-def now() -> float:
-    return time.monotonic()
 
 
 def strip_sql(sql: str) -> str:
@@ -79,6 +76,40 @@ def normalize_extra_filter(extra_filter: str) -> str:
     return s
 
 
+def slug_id_part(text: str) -> str:
+    s = (text or "").strip().upper()
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^A-Z0-9_-]+", "", s)
+    s = re.sub(r"_{2,}", "_", s).strip("_")
+    if not s:
+        s = "X"
+    return s[:40]
+
+
+def idnumber_root() -> str:
+    return "SALAS"
+
+
+def idnumber_coligada(codcoligada: str) -> str:
+    return f"{idnumber_root()}-{slug_id_part(codcoligada)}"[:100]
+
+
+def idnumber_periodo(col_idnumber: str, catperiodo: str) -> str:
+    return f"{col_idnumber}-PER-{slug_id_part(catperiodo)}"[:100]
+
+
+def idnumber_modalidade(per_idnumber: str, modalidade: str) -> str:
+    return f"{per_idnumber}-MOD-{slug_id_part(modalidade)}"[:100]
+
+
+def idnumber_curso(mod_idnumber: str, curso: str) -> str:
+    return f"{mod_idnumber}-CUR-{slug_id_part(curso)}"[:100]
+
+
+def idnumber_turma(cur_idnumber: str, turma: str) -> str:
+    return f"{cur_idnumber}-TUR-{slug_id_part(turma)}"[:100]
+
+
 def get_platform(platform_id: int) -> tuple[str, str, str, str] | None:
     if not DB_PATH.exists():
         return None
@@ -95,11 +126,6 @@ def get_platform(platform_id: int) -> tuple[str, str, str, str] | None:
 
 
 def get_sala_modelo(sala_modelo_id: int) -> tuple[int, str, str, str] | None:
-    """
-    Retorna (platform_id, name, moodle_id, extra_filter).
-
-    moodle_id = ID NUMÉRICO DO CURSO MODELO no Moodle (courseid).
-    """
     if not DB_PATH.exists():
         return None
     conn = sqlite3.connect(DB_PATH)
@@ -119,9 +145,7 @@ def get_sala_modelo(sala_modelo_id: int) -> tuple[int, str, str, str] | None:
 def get_rm_config() -> tuple[str, str, str, str] | None:
     conn = sqlite3.connect(DB_PATH)
     try:
-        cur = conn.execute(
-            "SELECT host, database_name, username, password FROM rm_config WHERE id = 1"
-        )
+        cur = conn.execute("SELECT host, database_name, username, password FROM rm_config WHERE id = 1")
         row = cur.fetchone()
         return (row[0], row[1], row[2], row[3]) if row else None
     finally:
@@ -131,9 +155,7 @@ def get_rm_config() -> tuple[str, str, str, str] | None:
 def get_rm_query(key: str) -> str:
     conn = sqlite3.connect(DB_PATH)
     try:
-        cur = conn.execute(
-            "SELECT coligadas, periodos, cursos, turmas, salas FROM rm_queries WHERE id = 1"
-        )
+        cur = conn.execute("SELECT coligadas, periodos, cursos, turmas, salas FROM rm_queries WHERE id = 1")
         row = cur.fetchone()
         if not row:
             return ""
@@ -182,11 +204,7 @@ def col_index(columns: List[str], name: str) -> Optional[int]:
 
 def moodle_call(base_url: str, token: str, function: str, params: Dict[str, Any]) -> Any:
     url = base_url.rstrip("/") + "/webservice/rest/server.php"
-    payload = {
-        "wstoken": token,
-        "wsfunction": function,
-        "moodlewsrestformat": "json",
-    }
+    payload = {"wstoken": token, "wsfunction": function, "moodlewsrestformat": "json"}
     payload.update(params)
 
     resp = requests.post(url, data=payload, timeout=60)
@@ -199,9 +217,7 @@ def moodle_call(base_url: str, token: str, function: str, params: Dict[str, Any]
 
 
 def test_token(base_url: str, token: str) -> None:
-    log("Testando token do Moodle...")
     moodle_call(base_url, token, "core_webservice_get_site_info", {})
-    log("Token válido.")
 
 
 def assert_course_exists_by_id(base_url: str, token: str, courseid: int) -> None:
@@ -216,17 +232,7 @@ def assert_course_exists_by_id(base_url: str, token: str, courseid: int) -> None
         raise RuntimeError("invalidcourseid: Curso modelo não encontrado no Moodle")
 
 
-def find_root_category_id_by_name(base_url: str, token: str, name: str) -> int | None:
-    """
-    Localiza uma categoria raiz (parent=0) com nome exato.
-    Se houver múltiplas, escolhe a que tem mais filhos diretos.
-    Empate: escolhe a de maior id.
-    """
-    name = (name or "").strip()
-    if not name:
-        return None
-
-    # Busca mais robusta: parent=0 e name=SALAS
+def find_root_category_by_idnumber(base_url: str, token: str, root_idnum: str) -> Optional[int]:
     data = moodle_call(
         base_url,
         token,
@@ -234,91 +240,69 @@ def find_root_category_id_by_name(base_url: str, token: str, name: str) -> int |
         {
             "criteria[0][key]": "parent",
             "criteria[0][value]": "0",
-            "criteria[1][key]": "name",
-            "criteria[1][value]": name,
+            "criteria[1][key]": "idnumber",
+            "criteria[1][value]": root_idnum,
         },
     )
-
-    cats = data if isinstance(data, list) else []
-    roots: list[dict] = []
-
-    for c in cats:
-        try:
-            if int(c.get("parent", -1)) == 0 and str(c.get("name", "")).strip() == name:
-                roots.append(c)
-        except Exception:
-            continue
-
-    if not roots:
-        return None
-
-    # Se só existe uma, retorna direto
-    if len(roots) == 1:
-        return int(roots[0].get("id"))
-
-    # Se existem múltiplas, escolher a "melhor" (mais filhos diretos)
-    def count_children(root_id: int) -> int:
-        try:
-            children = moodle_call(
-                base_url,
-                token,
-                "core_course_get_categories",
-                {"criteria[0][key]": "parent", "criteria[0][value]": str(int(root_id))},
-            )
-            if isinstance(children, list):
-                return len(children)
-        except Exception:
-            pass
-        return 0
-
-    scored: list[tuple[int, int]] = []  # (children_count, root_id)
-    for r in roots:
-        try:
-            rid = int(r.get("id"))
-            scored.append((count_children(rid), rid))
-        except Exception:
-            continue
-
-    if not scored:
-        # fallback: maior id (mais recente)
-        return int(max(int(r.get("id", 0)) for r in roots))
-
-    # maior número de filhos; empate => maior id
-    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-
-    chosen_children, chosen_id = scored[0]
-    log(
-        f"Aviso: existem múltiplas categorias raiz '{name}'. "
-        f"Escolhendo id={chosen_id} (filhos={chosen_children})."
-    )
-    return int(chosen_id)
+    if isinstance(data, list) and data:
+        ids = []
+        for c in data:
+            try:
+                if int(c.get("parent", -1)) == 0 and str(c.get("idnumber", "")).strip() == root_idnum:
+                    ids.append(int(c.get("id")))
+            except Exception:
+                continue
+        return max(ids) if ids else None
+    return None
 
 
-def find_category_id(base_url: str, token: str, name: str, parent_id: int) -> int | None:
+def find_category_by_parent_and_idnumber(base_url: str, token: str, parent_id: int, idnumber: str) -> Optional[int]:
     data = moodle_call(
         base_url,
         token,
         "core_course_get_categories",
         {
             "criteria[0][key]": "parent",
-            "criteria[0][value]": str(parent_id),
-            "criteria[1][key]": "name",
-            "criteria[1][value]": name,
+            "criteria[0][value]": str(int(parent_id)),
+            "criteria[1][key]": "idnumber",
+            "criteria[1][value]": idnumber,
         },
     )
     if isinstance(data, list) and data:
-        return int(data[0].get("id"))
+        ids = []
+        for c in data:
+            try:
+                if int(c.get("parent", -1)) == int(parent_id) and str(c.get("idnumber", "")).strip() == idnumber:
+                    ids.append(int(c.get("id")))
+            except Exception:
+                continue
+        return max(ids) if ids else None
     return None
 
 
-def create_category(base_url: str, token: str, name: str, parent_id: int) -> int:
-    data = moodle_call(
-        base_url,
-        token,
-        "core_course_create_categories",
-        {"categories[0][name]": name, "categories[0][parent]": str(parent_id)},
-    )
-    if isinstance(data, list) and data:
+def create_category(base_url: str, token: str, name: str, parent_id: int, idnumber: Optional[str]) -> int:
+    params: Dict[str, Any] = {
+        "categories[0][name]": name,
+        "categories[0][parent]": str(int(parent_id)),
+    }
+    if idnumber:
+        params["categories[0][idnumber]"] = idnumber
+
+    try:
+        data = moodle_call(base_url, token, "core_course_create_categories", params)
+    except Exception as exc:
+        if idnumber:
+            log(f"Aviso: falha ao criar categoria com idnumber='{idnumber}'. Tentando sem idnumber. Detalhe: {exc}")
+            data = moodle_call(
+                base_url,
+                token,
+                "core_course_create_categories",
+                {"categories[0][name]": name, "categories[0][parent]": str(int(parent_id))},
+            )
+        else:
+            raise
+
+    if isinstance(data, list) and data and isinstance(data[0], dict) and data[0].get("id"):
         return int(data[0].get("id"))
     raise RuntimeError("Falha ao criar categoria")
 
@@ -347,9 +331,6 @@ def duplicate_course_from_model_minimal(
     shortname: str,
     visible: int = 1,
 ) -> int:
-    """
-    Ajuste crítico: enviar SOMENTE users=0.
-    """
     params: Dict[str, Any] = {
         "courseid": str(int(model_course_id)),
         "fullname": fullname,
@@ -360,18 +341,12 @@ def duplicate_course_from_model_minimal(
         "options[0][value]": "0",
     }
 
-    log(
-        "Duplicando curso modelo com options: [users=0] | "
-        f"model_course_id={model_course_id} | categoryid={categoryid} | shortname={shortname}"
-    )
-
     data = moodle_call(base_url, token, "core_course_duplicate_course", params)
-
     if isinstance(data, dict) and "id" in data:
         return int(data["id"])
     if isinstance(data, list) and data and isinstance(data[0], dict) and "id" in data[0]:
         return int(data[0]["id"])
-    raise RuntimeError("Falha ao duplicar curso (retorno inesperado)")
+    raise RuntimeError("Falha ao duplicar curso")
 
 
 def update_course_fields(
@@ -408,7 +383,7 @@ def main() -> int:
     parser.add_argument("--platform-id", required=True, type=int)
     parser.add_argument("--periodo", default="")
     parser.add_argument("--sala-modelo-id", type=int, default=None)
-    parser.add_argument("--create-courses", default="1")  # flag do checkbox
+    parser.add_argument("--create-courses", default="1")
     args = parser.parse_args()
 
     platform = get_platform(args.platform_id)
@@ -419,7 +394,7 @@ def main() -> int:
     platform_name, base_url, token, coligadas_csv = platform
 
     if args.create_courses != "1":
-        log("Criação de salas desativada (--create-courses=0).")
+        log("Criação de salas desativada.")
         return 0
 
     if args.sala_modelo_id is None:
@@ -428,7 +403,7 @@ def main() -> int:
 
     sm = get_sala_modelo(int(args.sala_modelo_id))
     if not sm:
-        log(f"Sala Modelo id={args.sala_modelo_id} não encontrada.")
+        log("Sala Modelo não encontrada.")
         return 2
 
     sm_platform_id, sm_name, sm_course_model_id, sm_extra = sm
@@ -436,11 +411,9 @@ def main() -> int:
         log("Erro: Sala Modelo não pertence à plataforma selecionada.")
         return 2
 
-    sala_modelo_name = (sm_name or "").strip()
     sala_modelo_extra_filter = normalize_extra_filter(sm_extra)
-
     if not (sm_course_model_id or "").strip().isdigit():
-        log("Erro: moodle_id da Sala Modelo deve ser o ID do curso modelo (/course/view.php?id=XXX).")
+        log("Erro: moodle_id da Sala Modelo deve ser ID numérico do curso no Moodle.")
         return 2
 
     model_course_id = int(str(sm_course_model_id).strip())
@@ -448,27 +421,15 @@ def main() -> int:
     selected_catperiodo = normalize_str(args.periodo).replace("/", "-")
     filter_by_period = bool(selected_catperiodo) and selected_catperiodo.lower() != "todos"
 
-    log("==== INÍCIO - SALAS (BACKFILL CLONE DO MODELO) ====")
-    log(f"Arquivo em execução: {Path(__file__).resolve()}")
-    log(f"Plataforma: {platform_name} (ID {args.platform_id})")
-    log(f"Sala Modelo: {sala_modelo_name or '(sem nome)'} | Curso Modelo ID: {model_course_id}")
-    log(f"Filtro Extra (Sala Modelo): {sala_modelo_extra_filter or '(vazio)'}")
-    log(f"Período (CATPERIODO): {selected_catperiodo if filter_by_period else 'Todos'}")
+    test_token(base_url, token)
+    assert_course_exists_by_id(base_url, token, model_course_id)
 
-    try:
-        test_token(base_url, token)
-        assert_course_exists_by_id(base_url, token, model_course_id)
-    except Exception as exc:
-        log(f"Falha em validações iniciais (token/curso modelo): {exc}")
-        return 3
-
-    root_id = find_root_category_id_by_name(base_url, token, "SALAS")
+    root_idnum = idnumber_root()
+    root_id = find_root_category_by_idnumber(base_url, token, root_idnum)
     if root_id is None:
-        log("Categoria raiz 'SALAS' não existe; criando...")
-        root_id = create_category(base_url, token, "SALAS", 0)
-        log(f"Categoria raiz 'SALAS' criada (id={root_id}).")
-    else:
-        log(f"Categoria raiz 'SALAS' OK (id={root_id}).")
+        log("Raiz SALAS por idnumber não existe. Criando...")
+        root_id = create_category(base_url, token, "SALAS", 0, root_idnum)
+        log(f"Raiz criada id={root_id}")
 
     allowed_coligadas = {normalize_numish(c) for c in (coligadas_csv or "").split(",") if normalize_numish(c)}
     if not allowed_coligadas:
@@ -477,7 +438,7 @@ def main() -> int:
 
     sql_base = get_rm_query("cursos")
     if not sql_base:
-        log("Erro: consulta RM (rm_queries.cursos) está vazia.")
+        log("Erro: consulta RM (rm_queries.cursos) vazia.")
         return 4
 
     sql_base = strip_sql(sql_base)
@@ -488,11 +449,7 @@ def main() -> int:
     if sala_modelo_extra_filter:
         sql += f"AND ({sala_modelo_extra_filter}) "
 
-    log("Executando consulta RM (base Categorias/Turmas/Salas)...")
-    t0 = now()
     columns, rows = rm_fetch(sql)
-    log(f"Consulta RM concluída em {now() - t0:.3f}s ({len(rows)} linhas)")
-
     if not columns or not rows:
         log("Consulta RM não retornou dados.")
         return 0
@@ -512,7 +469,6 @@ def main() -> int:
         "idnumber",
         "idhabilitacaofilial",
     ]
-
     idx: Dict[str, int] = {}
     missing: list[str] = []
     for k in required:
@@ -521,20 +477,18 @@ def main() -> int:
             missing.append(k.upper())
         else:
             idx[k] = i
-
     if missing:
-        log("Erro: consulta RM precisa retornar colunas para Salas.")
-        log("Faltando: " + ", ".join(missing))
+        log("Erro: consulta RM precisa retornar colunas para Salas. Faltando: " + ", ".join(missing))
         return 5
 
-    # Cache de categorias
-    cat_cache: Dict[Tuple[int, str], int | None] = {}
+    # Cache só por execução (não persistente)
+    cat_cache: Dict[Tuple[int, str], Optional[int]] = {}
 
-    def get_child(parent_id: int, name: str) -> int | None:
-        key = (parent_id, name)
+    def get_child_by_idnumber(parent_id: int, idnum: str) -> Optional[int]:
+        key = (parent_id, idnum)
         if key in cat_cache:
             return cat_cache[key]
-        cid = find_category_id(base_url, token, name, parent_id)
+        cid = find_category_by_parent_and_idnumber(base_url, token, parent_id, idnum)
         cat_cache[key] = cid
         return cid
 
@@ -570,36 +524,39 @@ def main() -> int:
         idhabilitacaofilial = normalize_str(r[idx["idhabilitacaofilial"]]).strip()
 
         if not (catperiodo and coligada_nome and catmodalidade and curso and codturma and fullname and shortname and idnumber):
+            missing_data += 1
             continue
 
         if idnumber in seen_idnumbers:
             continue
         seen_idnumbers.add(idnumber)
 
-        # Localizar categoria da turma
-        coligada_cat_name = f"{codcoligada}-{coligada_nome}".strip("-")
-
-        coligada_id = get_child(root_id, coligada_cat_name)
+        col_idnum = idnumber_coligada(codcoligada)
+        coligada_id = get_child_by_idnumber(root_id, col_idnum)
         if not coligada_id:
             skipped_missing_category += 1
             continue
 
-        periodo_id = get_child(coligada_id, catperiodo)
+        per_idnum = idnumber_periodo(col_idnum, catperiodo)
+        periodo_id = get_child_by_idnumber(coligada_id, per_idnum)
         if not periodo_id:
             skipped_missing_category += 1
             continue
 
-        modalidade_id = get_child(periodo_id, catmodalidade)
+        mod_idnum = idnumber_modalidade(per_idnum, catmodalidade)
+        modalidade_id = get_child_by_idnumber(periodo_id, mod_idnum)
         if not modalidade_id:
             skipped_missing_category += 1
             continue
 
-        curso_id = get_child(modalidade_id, curso)
+        cur_idnum = idnumber_curso(mod_idnum, curso)
+        curso_id = get_child_by_idnumber(modalidade_id, cur_idnum)
         if not curso_id:
             skipped_missing_category += 1
             continue
 
-        turma_id = get_child(curso_id, codturma)
+        tur_idnum = idnumber_turma(cur_idnum, codturma)
+        turma_id = get_child_by_idnumber(curso_id, tur_idnum)
         if not turma_id:
             skipped_missing_category += 1
             continue
@@ -631,7 +588,6 @@ def main() -> int:
                     customfields=customfields,
                 )
                 updated += 1
-                time.sleep(0.02)
                 continue
 
             new_course_id = duplicate_course_from_model_minimal(
@@ -655,20 +611,17 @@ def main() -> int:
             )
 
             created += 1
-            time.sleep(0.02)
 
         except Exception as exc:
             errors += 1
             log(f"Erro ao duplicar/atualizar sala (turma={codturma}, idnumber={idnumber}, shortname={shortname}): {exc}")
 
-    log("==== RELATÓRIO - SALAS (BACKFILL CLONE DO MODELO) ====")
-    log(f"Salas criadas (duplicadas): {created}")
-    log(f"Salas atualizadas (já existiam): {updated}")
-    log(f"Ignoradas por categoria (turma) não encontrada: {skipped_missing_category}")
+    log("==== RELATÓRIO - SALAS ====")
+    log(f"Criadas: {created}")
+    log(f"Atualizadas: {updated}")
+    log(f"Ignoradas por categoria não encontrada: {skipped_missing_category}")
     log(f"Ignoradas por dados incompletos: {missing_data}")
     log(f"Erros: {errors}")
-    log("==== FIM - SALAS (BACKFILL CLONE DO MODELO) ====")
-
     return 0 if errors == 0 else 7
 
 

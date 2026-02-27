@@ -12,6 +12,9 @@ import requests
 
 DB_PATH = Path(__file__).resolve().parent.parent / "db" / "app.db"
 
+# Flag global de debug WS (habilitada por CLI)
+DEBUG_WS: bool = False
+
 
 def _force_utf8_stdout() -> None:
     try:
@@ -25,22 +28,65 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def moodle_call(base_url: str, token: str, function: str, params: Dict[str, Any]) -> Any:
+def _redact_token(tok: str) -> str:
+    tok = str(tok or "")
+    if len(tok) <= 8:
+        return "***"
+    return tok[:4] + "..." + tok[-4:]
+
+
+def _to_curl_equiv(url: str, payload: Dict[str, Any], timeout: int = 60) -> str:
+    # Formato curl equivalente ao POST application/x-www-form-urlencoded
+    parts = [
+        f'curl -sS -X POST "{url}" \\',
+    ]
+    for k, v in payload.items():
+        parts.append(f"  -d '{k}={v}' \\")
+    parts.append(f"  --max-time {int(timeout)}")
+    return "\n".join(parts)
+
+
+def moodle_call(base_url: str, token: str, function: str, params: Dict[str, Any], dbg_label: Optional[str] = None) -> Any:
     url = base_url.rstrip("/") + "/webservice/rest/server.php"
-    payload = {"wstoken": token, "wsfunction": function, "moodlewsrestformat": "json"}
-    payload.update(params)
+    payload: Dict[str, Any] = {"wstoken": token, "wsfunction": function, "moodlewsrestformat": "json"}
+    payload.update(params or {})
+
+    if DEBUG_WS:
+        label = (dbg_label or function).upper()
+        safe_payload = dict(payload)
+        safe_payload["wstoken"] = _redact_token(token)
+        log("")
+        log(f"[DEBUG_WS] {label} WS CALL: {function}")
+        log(f"[DEBUG_WS] URL: {url}")
+        log(f"[DEBUG_WS] PAYLOAD: {safe_payload}")
+        # curl equivalente com token redigido
+        curl_payload = dict(payload)
+        curl_payload["wstoken"] = _redact_token(token)
+        log("[DEBUG_WS] CURL_EQUIV:")
+        log(_to_curl_equiv(url, curl_payload))
 
     resp = requests.post(url, data=payload, timeout=60)
+
+    if DEBUG_WS:
+        ct = resp.headers.get("Content-Type", "")
+        body_preview = resp.text[:500].replace("\n", "\\n")
+        log(f"[DEBUG_WS] HTTP {resp.status_code} Content-Type={ct}")
+        log(f"[DEBUG_WS] BODY_PREVIEW(500): {body_preview}")
+
     resp.raise_for_status()
     data = resp.json()
 
     if isinstance(data, dict) and data.get("exception"):
-        raise RuntimeError(f"{data.get('errorcode')}: {data.get('message')}")
+        err = f"{data.get('errorcode')}: {data.get('message')}"
+        if data.get("debuginfo"):
+            err += f" | debuginfo={data.get('debuginfo')}"
+        raise RuntimeError(err + f" (wsfunction={function})")
     return data
 
 
-def test_token(base_url: str, token: str) -> None:
-    moodle_call(base_url, token, "core_webservice_get_site_info", {})
+def get_site_info(base_url: str, token: str) -> Dict[str, Any]:
+    res = moodle_call(base_url, token, "core_webservice_get_site_info", {}, dbg_label="site_info")
+    return res if isinstance(res, dict) else {}
 
 
 def strip_sql(sql: str) -> str:
@@ -69,7 +115,6 @@ def connect_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON;")
 
-    # Cache persistente de cohort por plataforma
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS cohort_map (
@@ -164,7 +209,9 @@ def build_filtered_sql_for_ensalamento(sql: str, coligadas: List[int], idperlet:
         in_list = ",".join(str(int(c)) for c in coligadas)
         clauses.append(f"STURMADISC.CODCOLIGADA IN ({in_list})")
     if idperlet is not None:
-        clauses.append(f"SPLETIVO.IDPERLET = {int(idperlet)}")
+        # Regra do projeto: filtro SEMPRE por IDPERLET para alunos e professores.
+        # Para evitar ambiguidade (SPLETIVO.IDPERLET vs STURMADISC.IDPERLET), fixamos em STURMADISC.IDPERLET.
+        clauses.append(f"STURMADISC.IDPERLET = {int(idperlet)}")
 
     if clauses:
         if _has_where(sql):
@@ -222,7 +269,6 @@ def _parse_int(value: Any) -> Optional[int]:
 
 
 def _normalize_name(name: str) -> str:
-    # Normalização forte para comparação e cache
     s = (name or "").strip()
     s = re.sub(r"\s+", " ", s)
     return s.casefold()
@@ -269,18 +315,18 @@ def cohort_map_set(conn: sqlite3.Connection, platform_id: int, cohort_name: str,
 
 
 def search_cohort_by_query(base_url: str, token: str, query: str) -> List[Dict[str, Any]]:
-    # Função de busca padronizada (com limitfrom/limitnum para evitar invalidparameter em alguns ambientes)
     res = moodle_call(
         base_url,
         token,
         "core_cohort_search_cohorts",
         {
             "query": query,
-            "contextid": 1,
+            "contextid": 1,  # sistema
             "includes": "all",
             "limitfrom": 0,
             "limitnum": 200,
         },
+        dbg_label="cohort_search",
     )
     if isinstance(res, dict):
         cohorts = res.get("cohorts") or []
@@ -297,15 +343,6 @@ def ensure_cohort(
     cohort_name: str,
     mem_cache: Dict[str, int],
 ) -> Optional[int]:
-    """
-    Regra: NÃO DUPLICAR.
-    Ordem:
-      1) cache em memória (execução atual)
-      2) busca WS por nome normalizado
-      3) busca WS por idnumber derivado do nome
-      4) cache persistente SQLite (fallback quando WS de busca é limitado)
-      5) cria (somente se realmente não encontrou)
-    """
     cohort_name = (cohort_name or "").strip()
     if not cohort_name:
         return None
@@ -316,7 +353,7 @@ def ensure_cohort(
 
     idnumber = _make_idnumber_from_name(cohort_name)
 
-    # 2) Busca por nome (WS)
+    # 2) Busca por nome
     try:
         items = search_cohort_by_query(base_url, token, cohort_name)
         for c in items:
@@ -327,10 +364,9 @@ def ensure_cohort(
                 cohort_map_set(conn, platform_id, cohort_name, cid, str(c.get("idnumber") or idnumber))
                 return cid
     except Exception:
-        # Se o WS de busca falhar, seguimos para outros mecanismos
         pass
 
-    # 3) Busca por idnumber (WS)
+    # 3) Busca por idnumber
     try:
         items = search_cohort_by_query(base_url, token, idnumber)
         for c in items:
@@ -343,14 +379,14 @@ def ensure_cohort(
     except Exception:
         pass
 
-    # 4) Cache persistente (evita recriar se já criamos em execução anterior)
+    # 4) Cache persistente
     cached = cohort_map_get(conn, platform_id, cohort_name)
     if cached:
         cid, _ = cached
         mem_cache[name_norm] = cid
         return cid
 
-    # 5) Criar (somente agora)
+    # 5) Criar
     created = moodle_call(
         base_url,
         token,
@@ -364,6 +400,7 @@ def ensure_cohort(
             "cohorts[0][descriptionformat]": 1,
             "cohorts[0][visible]": 1,
         },
+        dbg_label="cohort_create",
     )
 
     if isinstance(created, list) and created and isinstance(created[0], dict) and created[0].get("id"):
@@ -373,6 +410,79 @@ def ensure_cohort(
         return cid
 
     return None
+
+
+def _ws_error_means_function_not_available(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return ("wsfunction=" in s) and ("not available" in s or "não está disponível" in s or "nao esta disponivel" in s)
+
+
+def check_cohort_ws_available(base_url: str, token: str) -> Tuple[bool, str]:
+    try:
+        moodle_call(base_url, token, "core_cohort_get_cohorts", {}, dbg_label="cohort_get_1")
+        return True, "Cohorts: WS disponível para este token."
+    except Exception as exc:
+        if _ws_error_means_function_not_available(exc):
+            return False, "AVISO: cohorts desabilitado automaticamente. Motivo: serviço/token não expõe core_cohort_get_cohorts."
+        return False, f"AVISO: cohorts desabilitado automaticamente. Motivo: sem permissão/erro ao chamar core_cohort_get_cohorts: {exc}"
+
+
+def _is_invalidparameter(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return "invalidparameter" in s or "invalid_parameter" in s
+
+
+def diag_cohort_add_invalidparameter(base_url: str, token: str, cohort_id: int, user_id: int) -> str:
+    """
+    Quando core_cohort_add_cohort_members retorna invalidparameter, este DIAG tenta provar:
+      - cohort existe
+      - user existe
+    Se ambos existem, a causa mais provável é PERMISSÃO/CAPABILITY/CONTEXTO.
+    """
+    cohort_exists = False
+    user_exists = False
+
+    try:
+        cohorts = moodle_call(base_url, token, "core_cohort_get_cohorts", {}, dbg_label="diag_cohort_get")
+        if isinstance(cohorts, list):
+            for c in cohorts:
+                if isinstance(c, dict) and int(c.get("id") or 0) == int(cohort_id):
+                    cohort_exists = True
+                    break
+    except Exception:
+        pass
+
+    try:
+        ures = moodle_call(
+            base_url,
+            token,
+            "core_user_get_users_by_field",
+            {"field": "id", "values[0]": int(user_id)},
+            dbg_label="diag_user_by_id",
+        )
+        if isinstance(ures, list) and ures:
+            try:
+                user_exists = int(ures[0].get("id") or 0) == int(user_id)
+            except Exception:
+                user_exists = False
+    except Exception:
+        pass
+
+    if cohort_exists and user_exists:
+        return (
+            "DIAG: cohortid e userid existem (confirmado via WS). "
+            "Causa mais provável: permissões/capability/contexto para adicionar membros em cohort. "
+            "Garanta que o usuário do token tenha moodle/cohort:assign (e moodle/cohort:view) no CONTEXTO SISTEMA "
+            "ou no contexto onde o cohort está, e que a função core_cohort_add_cohort_members esteja no serviço."
+        )
+
+    if not cohort_exists and user_exists:
+        return "DIAG: userid existe, mas cohortid não foi encontrado na listagem WS. Verifique se o cohortid é válido/visível ao token."
+
+    if cohort_exists and not user_exists:
+        return "DIAG: cohortid existe, mas userid não foi encontrado via WS. Verifique se o usuário existe/está acessível ao token."
+
+    return "DIAG: não foi possível confirmar existência de cohortid/userid via WS (token pode estar limitado). Verifique permissões e se os IDs são válidos."
 
 
 def add_user_to_cohort(
@@ -386,16 +496,27 @@ def add_user_to_cohort(
     if key in membership_cache:
         return
 
-    moodle_call(
-        base_url,
-        token,
-        "core_cohort_add_cohort_members",
-        {
-            "members[0][cohortid]": int(cohort_id),
-            "members[0][userid]": int(user_id),
-        },
-    )
-    membership_cache.add(key)
+    # chamada padrão REST (o que o Moodle espera) - estrutura com cohorttype/usertype
+    try:
+        moodle_call(
+            base_url,
+            token,
+            "core_cohort_add_cohort_members",
+            {
+                "members[0][cohorttype][type]": "id",
+                "members[0][cohorttype][value]": str(int(cohort_id)),
+                "members[0][usertype][type]": "id",
+                "members[0][usertype][value]": str(int(user_id)),
+            },
+            dbg_label="cohort_add_member",
+        )
+        membership_cache.add(key)
+        return
+    except Exception as exc:
+        if _is_invalidparameter(exc):
+            diag = diag_cohort_add_invalidparameter(base_url, token, int(cohort_id), int(user_id))
+            raise RuntimeError(f"{exc} | {diag}")
+        raise
 
 
 def get_course_id_by_shortname(base_url: str, token: str, shortname: str, cache: Dict[str, int]) -> Optional[int]:
@@ -405,7 +526,13 @@ def get_course_id_by_shortname(base_url: str, token: str, shortname: str, cache:
     if shortname in cache:
         return cache[shortname]
 
-    res = moodle_call(base_url, token, "core_course_get_courses_by_field", {"field": "shortname", "value": shortname})
+    res = moodle_call(
+        base_url,
+        token,
+        "core_course_get_courses_by_field",
+        {"field": "shortname", "value": shortname},
+        dbg_label="course_get_by_field",
+    )
     if isinstance(res, dict):
         courses = res.get("courses") or []
         if courses:
@@ -422,7 +549,13 @@ def get_user_id_by_username(base_url: str, token: str, username: str, cache: Dic
     if username in cache:
         return cache[username]
 
-    res = moodle_call(base_url, token, "core_user_get_users_by_field", {"field": "username", "values[0]": username})
+    res = moodle_call(
+        base_url,
+        token,
+        "core_user_get_users_by_field",
+        {"field": "username", "values[0]": username},
+        dbg_label="user_get_by_username",
+    )
     if isinstance(res, list) and res:
         uid = int(res[0].get("id"))
         cache[username] = uid
@@ -456,7 +589,13 @@ def _status_means_enabled(status: Any) -> bool:
 
 def course_has_enabled_manual_enrol(base_url: str, token: str, course_id: int, label: str, shortname: str) -> bool:
     try:
-        res = moodle_call(base_url, token, "core_enrol_get_course_enrolment_methods", {"courseid": int(course_id)})
+        res = moodle_call(
+            base_url,
+            token,
+            "core_enrol_get_course_enrolment_methods",
+            {"courseid": int(course_id)},
+            dbg_label="enrol_methods",
+        )
     except Exception as exc:
         log(
             f"[{label}] AVISO: não foi possível consultar métodos de inscrição via WS "
@@ -501,13 +640,20 @@ def enrol_user(base_url: str, token: str, course_id: int, user_id: int, role_id:
             "enrolments[0][courseid]": int(course_id),
             "enrolments[0][suspend]": int(suspend),
         },
+        dbg_label="enrol_user",
     )
 
 
 def verify_course_enrolments(base_url: str, token: str, course_id: int, expected_user_ids: Set[int]) -> Dict[int, Dict[str, Any]]:
     out: Dict[int, Dict[str, Any]] = {uid: {"enrolled": False} for uid in expected_user_ids}
     try:
-        enrolled = moodle_call(base_url, token, "core_enrol_get_enrolled_users", {"courseid": int(course_id)})
+        enrolled = moodle_call(
+            base_url,
+            token,
+            "core_enrol_get_enrolled_users",
+            {"courseid": int(course_id)},
+            dbg_label="enrolled_users",
+        )
     except Exception:
         return out
 
@@ -525,14 +671,18 @@ def verify_course_enrolments(base_url: str, token: str, course_id: int, expected
 
 
 def main() -> int:
+    global DEBUG_WS
     _force_utf8_stdout()
 
-    parser = argparse.ArgumentParser(description="Ensalamento (matrícula) no Moodle a partir de SQL do RM.")
+    parser = argparse.ArgumentParser(description="Ensalamento (matrícula + cohorts) no Moodle a partir de SQL do RM.")
     parser.add_argument("--platform-id", type=int, required=True)
     parser.add_argument("--idperlet", type=str, default="")
     parser.add_argument("--ensalamento-alunos", type=int, default=1)
     parser.add_argument("--ensalamento-professores", type=int, default=0)
+    parser.add_argument("--debug-ws", type=int, default=0)
     args = parser.parse_args()
+
+    DEBUG_WS = bool(int(args.debug_ws or 0))
 
     start = time.time()
 
@@ -554,8 +704,13 @@ def main() -> int:
         rm_config = get_rm_config(conn)
 
         log("Validando token do Moodle...")
-        test_token(base_url, token)
+        siteinfo = get_site_info(base_url, token)
         log("Token OK.")
+
+        ws_userid = siteinfo.get("userid")
+        ws_username = siteinfo.get("username")
+        ws_fullname = siteinfo.get("fullname")
+        log(f"WS identity: userid={ws_userid} username={ws_username} fullname={ws_fullname}")
 
         modes: List[Tuple[str, str]] = []
         if args.ensalamento_alunos:
@@ -567,8 +722,10 @@ def main() -> int:
             log("RESUMO_FINAL: Nenhum modo selecionado.")
             return 0
 
-        # Caches
-        cohort_cache: Dict[str, int] = {}  # key: normalized name
+        cohorts_enabled, cohorts_msg = check_cohort_ws_available(base_url, token)
+        log(cohorts_msg)
+
+        cohort_cache: Dict[str, int] = {}
         membership_cache: Set[Tuple[int, int]] = set()
         course_cache: Dict[str, int] = {}
         user_cache: Dict[str, int] = {}
@@ -583,6 +740,7 @@ def main() -> int:
         total_manual_disabled = 0
         total_cohort_memberships_ok = 0
         total_cohort_memberships_fail = 0
+        cohorts_skip_count = 0
 
         for query_key, label in modes:
             sql_raw = get_rm_query(conn, query_key)
@@ -591,6 +749,10 @@ def main() -> int:
                 continue
 
             sql = build_filtered_sql_for_ensalamento(sql_raw, coligadas, idperlet)
+            # Pedido: no debug do ensalamento, mostrar APENAS o SQL final usado para filtrar
+            # (sem prefixos/labels ao lado). Vale para ALUNOS e PROFESSORES.
+            if DEBUG_WS and label in ("PROFESSORES", "ALUNOS"):
+                log(sql)
             if not sql:
                 log(f"[{label}] SQL inválido após filtros.")
                 continue
@@ -639,27 +801,40 @@ def main() -> int:
                     log(f"[{label}] ERRO: usuário não encontrado (username='{username}'). Linha {line_no}.")
                     continue
 
-                # Cohorts conforme a linha (agora sem duplicar)
+                # Cohorts por linha
                 for ci in [ic1, ic2, ic3]:
-                    if ci >= 0:
-                        cname = str(r[ci] or "").strip()
-                        if cname:
-                            try:
-                                cid = ensure_cohort(
-                                    conn=conn,
-                                    platform_id=int(args.platform_id),
-                                    base_url=base_url,
-                                    token=token,
-                                    cohort_name=cname,
-                                    mem_cache=cohort_cache,
-                                )
-                                if cid:
-                                    add_user_to_cohort(base_url, token, cid, user_id, membership_cache)
-                                    total_cohort_memberships_ok += 1
-                                    log(f"[{label}] Cohort membro OK: '{cname}' (cohortid={cid}) <= user '{username}' (userid={user_id})")
-                            except Exception as exc:
-                                total_cohort_memberships_fail += 1
-                                log(f"[{label}] ERRO: inserir em cohort '{cname}' para user '{username}': {exc}")
+                    if ci < 0:
+                        continue
+                    cname = str(r[ci] or "").strip()
+                    if not cname:
+                        continue
+
+                    if not cohorts_enabled:
+                        cohorts_skip_count += 1
+                        continue
+
+                    cid: Optional[int] = None
+                    try:
+                        cid = ensure_cohort(
+                            conn=conn,
+                            platform_id=int(args.platform_id),
+                            base_url=base_url,
+                            token=token,
+                            cohort_name=cname,
+                            mem_cache=cohort_cache,
+                        )
+                        if cid:
+                            add_user_to_cohort(base_url, token, cid, user_id, membership_cache)
+                            total_cohort_memberships_ok += 1
+                            log(f"[{label}] Cohort membro OK: '{cname}' (cohortid={cid}) <= user '{username}' (userid={user_id})")
+                    except Exception as exc:
+                        if _ws_error_means_function_not_available(exc):
+                            cohorts_enabled = False
+                            cohorts_skip_count += 1
+                            log(f"[{label}] AVISO: cohorts desabilitado no meio da execução: função não disponível no serviço/token. Detalhe: {exc}")
+                        else:
+                            total_cohort_memberships_fail += 1
+                            log(f"[{label}] ERRO: inserir em cohort '{cname}' para user '{username}': {exc} | cohortid={cid if cid else 'N/A'} userid={user_id}")
 
                 manual_ok = course_has_enabled_manual_enrol(base_url, token, course_id, label, course_shortname)
                 if not manual_ok:
@@ -709,7 +884,8 @@ def main() -> int:
         resumo = (
             f"Processo concluído. Linhas: {total_rows}. OK: {total_success}. Falhas: {total_fail}. "
             f"Roleid inválido: {total_role_invalid}. Manual desabilitado (confirmado WS): {total_manual_disabled}. "
-            f"Cohort-members OK: {total_cohort_memberships_ok}, FALHA: {total_cohort_memberships_fail}. "
+            f"Cohort-members OK: {total_cohort_memberships_ok}, FALHA: {total_cohort_memberships_fail}, "
+            f"SKIP(cohorts off): {cohorts_skip_count}. "
             f"Verificação OK={verified_ok}, FALHA={verified_fail}. Tempo: {elapsed:.1f}s."
         )
         log("")

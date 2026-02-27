@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import sys
 import time
 from pathlib import Path
@@ -25,12 +24,15 @@ from ui_common import LazyComboBox
 
 
 class EnsalamentoTab(QWidget):
-    """
-    Aba Ensalamento (matrícula):
-    - Mesma ideia do combo de períodos das abas Estrutura e Inserção de Pessoas:
-      * filtra por CODCOLIGADA IN (...)
-      * lista CATPERIODO único, ordenado por ano/termo desc
-    - Diferença: o VALUE do item é o IDPERLET (para o script filtrar por SPLETIVO.IDPERLET).
+    """Aba Ensalamento.
+
+    Regras do combo Período (pedido):
+    - Ao selecionar uma plataforma, listar TODOS os períodos (IDPERLET) das coligadas dessa plataforma.
+    - Exibir no combo a coluna LABELPERIODO (label humano).
+    - O valor do item (currentData) deve ser o IDPERLET selecionado.
+
+    Observação importante:
+    - A query rm_queries.periodos precisa expor pelo menos: CODCOLIGADA, IDPERLET e LABELPERIODO.
     """
 
     def __init__(self) -> None:
@@ -59,6 +61,11 @@ class EnsalamentoTab(QWidget):
         self.chk_professores = QCheckBox("Ensalamento Professores")
         self.chk_professores.setChecked(False)
 
+        # Debug: habilita logs detalhados do WS e, no caso de PROFESSORES,
+        # imprime APENAS o SQL final usado para filtrar (pedido do projeto).
+        self.chk_debug_ws = QCheckBox("Debug (mostrar SQL/WS)")
+        self.chk_debug_ws.setChecked(True)
+
         self.run_btn = QPushButton("Executar")
         self.run_btn.setObjectName("ExecuteButton")
         self.run_btn.clicked.connect(self.on_run)
@@ -82,6 +89,7 @@ class EnsalamentoTab(QWidget):
         form_layout.addRow("Período", self.period_combo)
         form_layout.addRow("", self.chk_alunos)
         form_layout.addRow("", self.chk_professores)
+        form_layout.addRow("", self.chk_debug_ws)
 
         actions = QHBoxLayout()
         actions.addWidget(self.run_btn)
@@ -164,9 +172,9 @@ class EnsalamentoTab(QWidget):
                 cleaned.append("'" + v.replace("'", "''") + "'")
         return ", ".join(cleaned)
 
-    def _period_sort_key(self, catperiodo: str) -> tuple[int, int, str]:
-        # Igual ao ExecutionTab/InsercaoPessoasTab
-        s = (catperiodo or "").strip()
+    def _period_sort_key(self, label: str) -> tuple[int, int, str]:
+        """Ordena por ano/termo quando o label começar com YYYY..."""
+        s = (label or "").strip()
         if len(s) >= 4 and s[:4].isdigit():
             year = int(s[:4])
             rest = s[4:].lstrip("-_/ ").strip()
@@ -190,10 +198,11 @@ class EnsalamentoTab(QWidget):
         return (0, 0, s)
 
     def populate_periodos(self) -> None:
-        """
-        Modelo idêntico ao combo da aba Estrutura/Inserção, mas:
-        - exibimos CATPERIODO (como eles fazem)
-        - VALUE = IDPERLET (para usar no ensalamento)
+        """Carrega períodos filtrando por coligadas da plataforma.
+
+        - Exibe LABELPERIODO no combo
+        - currentData = IDPERLET
+        - Lista TODOS os IDPERLET (sem dedup por CATPERIODO)
         """
         self.period_combo.clear()
         self.period_combo.addItem("Todos", "")
@@ -213,9 +222,9 @@ class EnsalamentoTab(QWidget):
             self.append_log("Plataforma não tem coligadas selecionadas; não carregando períodos.")
             return
 
-        queries = get_rm_queries()
+        queries = get_rm_queries() or {}
         config = get_rm_config()
-        base_sql = queries.get("periodos", "").strip() if queries else ""
+        base_sql = (queries.get("periodos") or "").strip()
         if not base_sql or not config:
             self.append_log("Consulta/config do RM ausente; não carregando períodos.")
             return
@@ -227,10 +236,10 @@ class EnsalamentoTab(QWidget):
             self.append_log("Lista de coligadas inválida (IN vazio); não carregando períodos.")
             return
 
-        # Wrapper igual às outras abas: filtra por CODCOLIGADA.
-        # Precisamos de CATPERIODO e IDPERLET.
+        # Wrapper: filtra por CODCOLIGADA.
+        # Sua query atual retorna LABELPERIODO (sem underscore).
         sql = (
-            "SELECT X.CODCOLIGADA, X.CATPERIODO, X.IDPERLET "
+            "SELECT X.CODCOLIGADA, X.IDPERLET, X.LABELPERIODO "
             "FROM (" + base_no_order + ") X "
             f"WHERE X.CODCOLIGADA IN ({in_list}) "
         )
@@ -276,24 +285,25 @@ class EnsalamentoTab(QWidget):
             return columns.index(name) if name in columns else None
 
         idx_codcol = idx("codcoligada")
-        idx_catperiodo = idx("catperiodo")
         idx_idperlet = idx("idperlet")
 
-        if idx_codcol is None or idx_catperiodo is None or idx_idperlet is None:
-            self.append_log("SQL de períodos deve retornar: CODCOLIGADA, CATPERIODO, IDPERLET.")
+        # Aceita vários nomes possíveis para o label (mas o seu é LABELPERIODO)
+        idx_label = idx("labelperiodo")
+        if idx_label is None:
+            idx_label = idx("label_periodo")
+        if idx_label is None:
+            idx_label = idx("label")
+
+        if idx_codcol is None or idx_idperlet is None or idx_label is None:
+            self.append_log("SQL de períodos deve retornar: CODCOLIGADA, IDPERLET e LABELPERIODO.")
             return
 
-        # Dedup por CATPERIODO (igual às outras abas), mas guardando IDPERLET.
-        # Se houver múltiplos IDPERLET para o mesmo CATPERIODO, escolhe o maior (mais atual).
-        cat_to_id: dict[str, int] = {}
+        # Lista TODOS os IDPERLET (um item por IDPERLET)
+        by_id: dict[int, str] = {}
 
         for row in rows:
             codcol = self._norm(row[idx_codcol])
             if not codcol or codcol not in allowed:
-                continue
-
-            catperiodo = "" if row[idx_catperiodo] is None else str(row[idx_catperiodo]).strip()
-            if not catperiodo:
                 continue
 
             idperlet_str = self._norm(row[idx_idperlet])
@@ -301,21 +311,27 @@ class EnsalamentoTab(QWidget):
                 continue
             idperlet = int(idperlet_str)
 
-            prev = cat_to_id.get(catperiodo)
-            if prev is None or idperlet > prev:
-                cat_to_id[catperiodo] = idperlet
+            label = "" if row[idx_label] is None else str(row[idx_label]).strip()
+            if not label:
+                label = f"IDPERLET {idperlet}"
 
-        if not cat_to_id:
+            # Mantém o primeiro label não-vazio (ou substitui fallback por um label real)
+            if idperlet not in by_id:
+                by_id[idperlet] = label
+            else:
+                if by_id[idperlet].startswith("IDPERLET ") and not label.startswith("IDPERLET "):
+                    by_id[idperlet] = label
+
+        if not by_id:
             self.append_log("Nenhum período encontrado após filtragem por coligadas.")
             return
 
-        items = list(cat_to_id.keys())
-        items.sort(key=self._period_sort_key, reverse=True)
+        items = sorted(by_id.items(), key=lambda kv: (self._period_sort_key(kv[1]), kv[0]), reverse=True)
 
-        for catperiodo in items:
-            self.period_combo.addItem(catperiodo, str(cat_to_id[catperiodo]))
+        for idperlet, label in items:
+            self.period_combo.addItem(label, str(idperlet))
 
-        self.append_log(f"Períodos adicionados (únicos por CATPERIODO): {len(items)}")
+        self.append_log(f"Períodos adicionados (por IDPERLET): {len(items)}")
 
     def _lock_ui(self, running: bool) -> None:
         self.run_btn.setEnabled(not running)
@@ -324,6 +340,7 @@ class EnsalamentoTab(QWidget):
         self.period_combo.setEnabled(not running)
         self.chk_alunos.setEnabled(not running)
         self.chk_professores.setEnabled(not running)
+        self.chk_debug_ws.setEnabled(not running)
 
     def on_run(self) -> None:
         pid = self.platform_combo.currentData()
@@ -336,7 +353,11 @@ class EnsalamentoTab(QWidget):
             QMessageBox.warning(self, "Consulta ausente", "A consulta 'Ensalamento Alunos' está vazia (aba Consultas RM).")
             return
         if not (queries.get("ensalamento_professores") or "").strip() and self.chk_professores.isChecked():
-            QMessageBox.warning(self, "Consulta ausente", "A consulta 'Ensalamento Professores' está vazia (aba Consultas RM).")
+            QMessageBox.warning(
+                self,
+                "Consulta ausente",
+                "A consulta 'Ensalamento Professores' está vazia (aba Consultas RM).",
+            )
             return
         if not self.chk_alunos.isChecked() and not self.chk_professores.isChecked():
             QMessageBox.warning(self, "Opções", "Marque pelo menos uma opção de ensalamento.")
@@ -360,6 +381,8 @@ class EnsalamentoTab(QWidget):
             "1" if self.chk_alunos.isChecked() else "0",
             "--ensalamento-professores",
             "1" if self.chk_professores.isChecked() else "0",
+            "--debug-ws",
+            "1" if self.chk_debug_ws.isChecked() else "0",
         ]
 
         self.debug.clear()

@@ -24,13 +24,21 @@ from ui_common import LazyComboBox
 
 
 class InsercaoPessoasTab(QWidget):
+    """Aba Inserção de Pessoas.
+
+    Regras implementadas:
+    - Combo Período lista LABELPERIODO e guarda IDPERLET como value.
+    - Ao trocar plataforma, o combo recarrega e filtra por CODCOLIGADA IN (<coligadas da plataforma>).
+    - Checkbox "Debug (mostrar SQL/WS)": quando marcado, passa --debug-ws=1 ao script.
+      O script imprime APENAS o SQL final (sem rótulos) para ALUNOS e PROFESSORES.
+    """
+
     def __init__(self) -> None:
         super().__init__()
 
         self.proc: QProcess | None = None
         self.exec_timer = QElapsedTimer()
         self.exec_started = False
-
         self.last_summary_line: str = ""
 
         title = QLabel("Inserção de Pessoas")
@@ -56,10 +64,14 @@ class InsercaoPessoasTab(QWidget):
         self.chk_alunos.setChecked(True)
         self.chk_professores.setChecked(False)
 
+        self.chk_debug_sql = QCheckBox("Debug (mostrar SQL/WS)")
+        self.chk_debug_sql.setChecked(True)
+
         form_layout.addRow("Plataforma", self.platform_select)
         form_layout.addRow("Período", self.periodo_select)
         form_layout.addRow("", self.chk_alunos)
         form_layout.addRow("", self.chk_professores)
+        form_layout.addRow("", self.chk_debug_sql)
 
         self.execute_button = QPushButton("Executar")
         self.execute_button.setObjectName("ExecuteButton")
@@ -88,7 +100,11 @@ class InsercaoPessoasTab(QWidget):
         layout.addWidget(self.log)
 
         self.load_platforms()
+        self.on_platform_changed()
 
+    # -----------------
+    # Helpers
+    # -----------------
     def _decode_output(self, raw: bytes) -> str:
         if not raw:
             return ""
@@ -139,12 +155,12 @@ class InsercaoPessoasTab(QWidget):
                 cleaned.append("'" + v.replace("'", "''") + "'")
         return ", ".join(cleaned)
 
-    def _period_sort_key(self, catperiodo: str) -> tuple[int, int, str]:
-        s = (catperiodo or "").strip()
+    def _period_sort_key(self, label: str) -> tuple[int, int, str]:
+        # tenta ordenar por ANO/TERMO extraindo números do início do label
+        s = (label or "").strip()
         if len(s) >= 4 and s[:4].isdigit():
             year = int(s[:4])
             rest = s[4:].lstrip("-_/ ").strip()
-
             term = 0
             if rest:
                 token = ""
@@ -158,31 +174,45 @@ class InsercaoPessoasTab(QWidget):
                         term = int(token)
                     except Exception:
                         term = 0
-
             return (year, term, s)
-
         return (0, 0, s)
 
+    # -----------------
+    # Platform / Period
+    # -----------------
     def load_platforms(self) -> None:
         self.platform_select.clear()
-        for platform_id, name in list_platforms_for_select():
+        items = list_platforms_for_select()
+        self.platform_select.addItem("Selecione...", None)
+        for platform_id, name in items:
             self.platform_select.addItem(name, platform_id)
 
     def on_platform_changed(self) -> None:
         self.periodo_select.clear()
-        self.periodo_select.addItem("Todos", "Todos")
+        self.periodo_select.addItem("Todos", "")
         self.periodo_select.reset_loaded()
 
     def populate_periodos(self) -> None:
+        """Carrega períodos para a plataforma selecionada.
+
+        - Exibe LABELPERIODO
+        - Valor (data) é IDPERLET
+        - Filtra automaticamente por CODCOLIGADA IN (<coligadas da plataforma>)
+
+        Requisito: rm_queries.periodos deve retornar (no mínimo):
+        CODCOLIGADA, IDPERLET e LABELPERIODO.
+        """
+
         self.periodo_select.clear()
-        self.periodo_select.addItem("Todos", "Todos")
+        self.periodo_select.addItem("Todos", "")
 
         platform_id = self.platform_select.currentData()
         if platform_id is None:
             self.append_log("Nenhuma plataforma selecionada; não carregando períodos.")
             return
 
-        if not get_rm_config():
+        rm_cfg = get_rm_config()
+        if not rm_cfg:
             self.append_log("Config do RM ausente; não carregando períodos.")
             return
 
@@ -192,11 +222,10 @@ class InsercaoPessoasTab(QWidget):
             self.append_log("Plataforma não tem coligadas selecionadas; não carregando períodos.")
             return
 
-        queries = get_rm_queries()
-        config = get_rm_config()
-        base_sql = queries.get("periodos", "").strip() if queries else ""
-        if not base_sql or not config:
-            self.append_log("Consulta/config do RM ausente; não carregando períodos.")
+        queries = get_rm_queries() or {}
+        base_sql = (queries.get("periodos") or "").strip()
+        if not base_sql:
+            self.append_log("Consulta de períodos (rm_queries.periodos) vazia; não carregando períodos.")
             return
 
         base_sql = self._strip_sql(base_sql)
@@ -206,13 +235,14 @@ class InsercaoPessoasTab(QWidget):
             self.append_log("Lista de coligadas inválida (IN vazio); não carregando períodos.")
             return
 
+        # Wrapper para garantir filtro por coligada, independente do SQL base.
         sql = (
-            "SELECT X.CODCOLIGADA, X.CATPERIODO "
+            "SELECT X.CODCOLIGADA, X.IDPERLET, X.LABELPERIODO "
             "FROM (" + base_no_order + ") X "
-            f"WHERE X.CODCOLIGADA IN ({in_list}) "
+            f"WHERE X.CODCOLIGADA IN ({in_list})"
         )
 
-        host, db_name, username, password = config
+        host, db_name, username, password = rm_cfg
         try:
             import pyodbc  # type: ignore
         except Exception as exc:
@@ -253,36 +283,50 @@ class InsercaoPessoasTab(QWidget):
             return columns.index(name) if name in columns else None
 
         idx_codcol = idx("codcoligada")
-        idx_catperiodo = idx("catperiodo")
+        idx_idperlet = idx("idperlet")
+        idx_label = idx("labelperiodo")
 
-        if idx_codcol is None or idx_catperiodo is None:
-            self.append_log("SQL de períodos deve retornar: CODCOLIGADA, CATPERIODO.")
+        if idx_codcol is None or idx_idperlet is None or idx_label is None:
+            self.append_log("SQL de períodos deve retornar: CODCOLIGADA, IDPERLET, LABELPERIODO.")
             return
 
-        seen_cat: set[str] = set()
-        items: list[str] = []
+        by_id: dict[int, str] = {}
 
         for row in rows:
             codcol = self._norm(row[idx_codcol])
             if not codcol or codcol not in allowed:
                 continue
 
-            catperiodo = "" if row[idx_catperiodo] is None else str(row[idx_catperiodo]).strip()
-            if not catperiodo:
+            idperlet_str = self._norm(row[idx_idperlet])
+            if not idperlet_str or not idperlet_str.isdigit():
                 continue
+            idperlet = int(idperlet_str)
 
-            if catperiodo in seen_cat:
-                continue
-            seen_cat.add(catperiodo)
-            items.append(catperiodo)
+            label = "" if row[idx_label] is None else str(row[idx_label]).strip()
+            if not label:
+                label = f"IDPERLET {idperlet}"
 
-        items.sort(key=self._period_sort_key, reverse=True)
+            # 1 item por IDPERLET
+            if idperlet not in by_id:
+                by_id[idperlet] = label
+            else:
+                # melhora label se a anterior era fallback
+                if by_id[idperlet].startswith("IDPERLET ") and not label.startswith("IDPERLET "):
+                    by_id[idperlet] = label
 
-        for catperiodo in items:
-            self.periodo_select.addItem(catperiodo, catperiodo)
+        if not by_id:
+            self.append_log("Nenhum período encontrado após filtragem por coligadas.")
+            return
 
-        self.append_log(f"Períodos adicionados (únicos): {len(items)}")
+        items = sorted(by_id.items(), key=lambda kv: (self._period_sort_key(kv[1]), kv[0]), reverse=True)
+        for idperlet, label in items:
+            self.periodo_select.addItem(label, str(idperlet))
 
+        self.append_log(f"Períodos adicionados (por IDPERLET): {len(items)}")
+
+    # -----------------
+    # Execution
+    # -----------------
     def on_execute(self) -> None:
         if self.proc and self.proc.state() == QProcess.ProcessState.Running:
             QMessageBox.information(self, "Inserção de Pessoas", "Já existe uma execução em andamento.")
@@ -293,10 +337,7 @@ class InsercaoPessoasTab(QWidget):
             QMessageBox.warning(self, "Plataforma obrigatória", "Selecione uma plataforma.")
             return
 
-        periodo_value = self.periodo_select.currentData()
-        catperiodo = "" if periodo_value is None else str(periodo_value).strip()
-        if catperiodo.lower() == "todos":
-            catperiodo = ""
+        idperlet = (self.periodo_select.currentData() or "").strip()
 
         do_alunos = self.chk_alunos.isChecked()
         do_prof = self.chk_professores.isChecked()
@@ -310,8 +351,10 @@ class InsercaoPessoasTab(QWidget):
         args = [
             "--platform-id",
             str(int(platform_id)),
-            "--periodo",
-            catperiodo,
+            "--idperlet",
+            idperlet,
+            "--debug-ws",
+            "1" if self.chk_debug_sql.isChecked() else "0",
             "--insert-alunos",
             "1" if do_alunos else "0",
             "--insert-professores",
@@ -419,4 +462,5 @@ class InsercaoPessoasTab(QWidget):
         if self.exec_started and self.exec_timer.isValid():
             prefix = f"[+{self.exec_timer.elapsed() / 1000:.3f}s] "
 
+        # Mantém padrão do terminal (sem mexer em prefixos do script)
         self.log.appendPlainText(prefix + text)

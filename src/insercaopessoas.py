@@ -57,6 +57,44 @@ def strip_sql(sql: str) -> str:
     return sql
 
 
+
+def remove_last_order_by(sql: str) -> str:
+    lower = sql.lower()
+    pos = lower.rfind("order by")
+    if pos == -1:
+        return sql
+    return sql[:pos].strip()
+
+
+def sql_in_list(values: Set[str]) -> str:
+    cleaned: List[str] = []
+    for v in sorted(values):
+        v = normalize_numish(v)
+        if not v:
+            continue
+        if v.isdigit():
+            cleaned.append(v)
+        else:
+            cleaned.append("'" + v.replace("'", "''") + "'")
+    return ", ".join(cleaned)
+
+
+def build_filtered_sql(sql_base: str, allowed_coligadas: Set[str], idperlet: str) -> str:
+    """Aplica filtros automáticos (coligada + IDPERLET) usando wrapper SELECT * FROM (..) X."""
+    sql_base = strip_sql(sql_base)
+    sql_base = remove_last_order_by(sql_base)
+    in_list = sql_in_list(allowed_coligadas)
+    if not in_list:
+        return sql_base
+
+    where = [f"X.CODCOLIGADA IN ({in_list})"]
+    if idperlet:
+        # aceita apenas numérico
+        if not str(idperlet).isdigit():
+            raise RuntimeError("IDPERLET inválido (precisa ser numérico).")
+        where.append(f"X.IDPERLET = {idperlet}")
+
+    return "SELECT * FROM (" + sql_base + ") X WHERE " + " AND ".join(where)
 def get_platform(platform_id: int) -> tuple[str, str, str, str] | None:
     if not DB_PATH.exists():
         return None
@@ -302,32 +340,26 @@ def _row_to_desired_user(columns: List[str], row: tuple) -> Optional[Dict[str, A
     return desired
 
 
-def _fetch_people(kind: str, allowed_coligadas: Set[str]) -> Tuple[List[str], List[tuple]]:
+def _fetch_people(kind: str, allowed_coligadas: Set[str], idperlet: str, debug_ws: bool) -> Tuple[List[str], List[tuple]]:
     sql_base = strip_sql(get_rm_query(kind))
     if not sql_base:
         return ([], [])
 
-    log(f"Executando consulta RM: {kind.capitalize()}")
+    # Aplica filtros automáticos diretamente no SQL:
+    # - CODCOLIGADA IN (<coligadas da plataforma>)
+    # - IDPERLET = <selecionado> (quando informado)
+    sql_final = build_filtered_sql(sql_base, allowed_coligadas, idperlet)
+
+    # Debug pedido: quando habilitado, mostrar APENAS o SQL final usado (sem rótulos ao lado).
+    if debug_ws:
+        log(sql_final)
+
+    log(f"Executando consulta RM: {kind.capitalize()} (com filtros automáticos)")
     t0 = now()
-    cols, rows = rm_fetch(sql_base)
+    cols, rows = rm_fetch(sql_final)
     log(f"Consulta RM ({kind.capitalize()}) concluída em {now() - t0:.3f}s ({len(rows)} linhas)")
 
-    if not cols or not rows:
-        return (cols, rows)
-
-    idx_codcol = _idx(cols, "codcoligada")
-    if idx_codcol is None:
-        raise RuntimeError(
-            f"Seu SQL de {kind} precisa retornar a coluna CODCOLIGADA no SELECT (para filtrar pelas coligadas da plataforma)."
-        )
-
-    filtered: List[tuple] = []
-    for r in rows:
-        codcol = normalize_numish(r[idx_codcol])
-        if codcol in allowed_coligadas:
-            filtered.append(r)
-
-    return (cols, filtered)
+    return (cols, rows)
 
 
 # -------------------------
@@ -475,8 +507,16 @@ def moodle_update_user(base_url: str, token: str, user_id: int, desired: Dict[st
         return False, f"falha ao atualizar: {exc}"
 
 
-def process_kind(base_url: str, token: str, kind: str, allowed_coligadas: Set[str]) -> Dict[str, Any]:
-    cols, rows = _fetch_people(kind, allowed_coligadas)
+def process_kind(
+    base_url: str,
+    token: str,
+    kind: str,
+    allowed_coligadas: Set[str],
+    idperlet: str,
+    debug_ws: bool,
+) -> Dict[str, Any]:
+    # IMPORTANTE: idperlet/debug_ws vêm do argparse (escopo do main). Não usar variáveis globais.
+    cols, rows = _fetch_people(kind, allowed_coligadas, idperlet, debug_ws)
 
     desired_rows: List[Dict[str, Any]] = []
     ignored = 0
@@ -559,7 +599,9 @@ def main() -> int:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--platform-id", required=True, type=int)
-    parser.add_argument("--periodo", default="")
+    parser.add_argument("--periodo", default="")  # compat (antigo)
+    parser.add_argument("--idperlet", default="")
+    parser.add_argument("--debug-ws", default="0")
     parser.add_argument("--insert-alunos", default="1")
     parser.add_argument("--insert-professores", default="0")
     args = parser.parse_args()
@@ -570,14 +612,16 @@ def main() -> int:
         return 1
 
     platform_name, base_url, token, coligadas_csv = platform
-    periodo = normalize_str(args.periodo).replace("/", "-")
+    periodo = normalize_str(args.periodo).replace("/", "-")  # compat (antigo)
+    idperlet = normalize_numish(args.idperlet)
+    DEBUG_WS = args.debug_ws == "1"
     do_alunos = args.insert_alunos == "1"
     do_prof = args.insert_professores == "1"
 
     log("==== INÍCIO - INSERÇÃO DE PESSOAS ====")
     log(f"Arquivo em execução: {Path(__file__).resolve()}")
     log(f"Plataforma: {platform_name} (ID {args.platform_id})")
-    log(f"Período: {periodo or 'Todos'}")
+    log(f"Período (IDPERLET): {idperlet or 'Todos'}")
     log(f"Inserir alunos: {'Sim' if do_alunos else 'Não'}")
     log(f"Inserir professores: {'Sim' if do_prof else 'Não'}")
 
@@ -601,9 +645,9 @@ def main() -> int:
 
     try:
         if do_alunos:
-            results.append(process_kind(base_url, token, "alunos", allowed_coligadas))
+            results.append(process_kind(base_url, token, "alunos", allowed_coligadas, idperlet, DEBUG_WS))
         if do_prof:
-            results.append(process_kind(base_url, token, "professores", allowed_coligadas))
+            results.append(process_kind(base_url, token, "professores", allowed_coligadas, idperlet, DEBUG_WS))
     except Exception as exc:
         log(f"Falha geral na execução: {exc}")
         return 3
